@@ -77,13 +77,19 @@ except Exception as e:
     st.error(f"ดึงข้อมูลหรือคำนวณ {ticker} ไม่ได้: {e}")
     st.stop()
 
-name = auto_pick(fits) if strat_choice == "auto" else strat_choice
+if strat_choice != "auto" and strat_choice not in fits:
+    st.warning(f"{LABEL[strat_choice]} ใช้ไม่ได้กับข้อมูลชุดนี้ (ต้องมี High/Low) จึงใช้โหมดอัตโนมัติแทน")
+name = strat_choice if strat_choice in fits else auto_pick(fits)
 fit = fits[name]
 close = df["Close"]
 last_date, last_close = close.index[-1], float(close.iloc[-1])
 
 st.title(f"📈 {ticker}")
-st.caption(f"กลยุทธ์ที่ใช้: **{LABEL[name]}** · พารามิเตอร์ (เลือกจากช่วง Train) {fit['params']}")
+st.caption(f"กลยุทธ์ที่ใช้: **{LABEL[name]}** · พารามิเตอร์ (เลือกจากช่วง Train) {fit['params'] or 'ไม่มี (ค่าคงที่)'}")
+with st.expander("ℹ️ กลยุทธ์นี้ทำงานอย่างไร และควรระวังอะไร"):
+    what, caveat = bt.STRATEGY_INFO[name]
+    st.write(f"**หลักการ:** {what}")
+    st.write(f"**ที่มา/ข้อควรระวัง:** {caveat}")
 
 tab_sig, tab_chart, tab_res, tab_trades, tab_scan = st.tabs(
     ["🚦 สัญญาณวันนี้", "📊 กราฟราคา", "🧪 ผลทดสอบ", "🧾 รายการเทรด", "🔍 สแกนหลายตัว"])
@@ -120,7 +126,7 @@ with tab_sig:
             m4.metric("ผลเทรดล่าสุด", pct(t["return"]))
 
     st.subheader("ใกล้เกิดสัญญาณแค่ไหน")
-    for label, value in bt.trigger_levels(name, fit["params"], close):
+    for label, value in bt.trigger_levels(name, fit["params"], df):
         st.write(f"- {label}: **{value}**")
 
     st.subheader("ขนาดไม้และจุดตัดขาดทุน (แนวทางจัดการความเสี่ยง)")
@@ -177,12 +183,9 @@ with tab_chart:
         fig.add_trace(go.Scatter(x=s.index, y=s.values, name=label, mode="lines",
                                  line=dict(color=color, width=1.5, dash=dash)), row=1, col=1)
 
-    if name == "sma_cross":
-        line(close.rolling(p["fast"]).mean(), f"SMA{p['fast']}", BLUE)
-        line(close.rolling(p["slow"]).mean(), f"SMA{p['slow']}", ORANGE)
-    elif name == "breakout":
-        line(close.rolling(p["n"]).max().shift(1), f"สูงสุด {p['n']} วัน (ซื้อ)", GREEN, "dot")
-        line(close.rolling(p["exit_n"]).min().shift(1), f"ต่ำสุด {p['exit_n']} วัน (ขาย)", RED, "dot")
+    COLORS = {"blue": BLUE, "orange": ORANGE, "green": GREEN, "red": RED, "grey": GREY}
+    for label, series, ckey, dash in bt.overlay_lines(name, p, df):
+        line(series, label, COLORS[ckey], dash)
 
     # in-position shading + entry/exit markers
     tv = fit["trades"]
@@ -204,15 +207,26 @@ with tab_chart:
         hovertemplate="ขาย %{x|%Y-%m-%d}<br>%{y:,.2f}<br>ผลเทรด %{customdata:+.1f}%<extra></extra>"),
         row=1, col=1)
 
-    # lower panel: RSI
-    rn = p["n"] if name == "rsi_revert" else 14
-    r = bt.rsi(close, rn).reindex(view.index)
-    fig.add_trace(go.Scatter(x=r.index, y=r.values, name=f"RSI({rn})", line=dict(color="#ab47bc", width=1.3)),
-                  row=2, col=1)
-    lo, hi = (p["low"], p["exit_level"]) if name == "rsi_revert" else (30, 70)
-    fig.add_hline(y=lo, line_dash="dot", line_color=GREEN, row=2, col=1)
-    fig.add_hline(y=hi, line_dash="dot", line_color=RED, row=2, col=1)
-    fig.update_yaxes(range=[0, 100], row=2, col=1)
+    # lower panel: MACD for the MACD strategy, otherwise RSI
+    if name == "macd":
+        m_, sg_ = bt.macd_calc(close, p["fast"], p["slow"], p["sig"])
+        m_, sg_ = m_.reindex(view.index), sg_.reindex(view.index)
+        hist = m_ - sg_
+        fig.add_trace(go.Bar(x=hist.index, y=hist.values, name="Histogram",
+                             marker_color=[GREEN if v >= 0 else RED for v in hist.fillna(0)]), row=2, col=1)
+        fig.add_trace(go.Scatter(x=m_.index, y=m_.values, name="MACD", line=dict(color=BLUE, width=1.3)),
+                      row=2, col=1)
+        fig.add_trace(go.Scatter(x=sg_.index, y=sg_.values, name="Signal", line=dict(color=ORANGE, width=1.3)),
+                      row=2, col=1)
+    else:
+        rn = p["n"] if name == "rsi_revert" else 14
+        r = bt.rsi(close, rn).reindex(view.index)
+        fig.add_trace(go.Scatter(x=r.index, y=r.values, name=f"RSI({rn})", line=dict(color="#ab47bc", width=1.3)),
+                      row=2, col=1)
+        lo, hi = (p["low"], p["exit_level"]) if name == "rsi_revert" else (30, 70)
+        fig.add_hline(y=lo, line_dash="dot", line_color=GREEN, row=2, col=1)
+        fig.add_hline(y=hi, line_dash="dot", line_color=RED, row=2, col=1)
+        fig.update_yaxes(range=[0, 100], row=2, col=1)
 
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     fig.update_layout(height=680, xaxis_rangeslider_visible=False, hovermode="x unified",
@@ -254,6 +268,10 @@ with tab_res:
     if m_te.get("trades", 0) < 20:
         notes.append("⚠️ เทรดน้อยกว่า 20 ครั้ง สถิติยังไม่น่าเชื่อถือ")
     st.write(f"**{LABEL[name]}**: " + " · ".join(notes))
+    st.info("💡 ยิ่งลองกลยุทธ์และพารามิเตอร์มาก ก็ยิ่งมีโอกาสเจอตัวที่ \"บังเอิญดี\" ในช่วงทดสอบ "
+            "ควรเชื่อกลยุทธ์ที่ดีทั้ง Train และ Test ใกล้เคียงกัน, ใช้ได้กับหุ้นหลายตัว (ลองแท็บสแกน) "
+            "และมีเหตุผลรองรับ มากกว่าเลือกตัวที่ตัวเลข Test สูงสุดตัวเดียว "
+            "ตัว \"โหวตหลายเทรนด์\" ไม่มีพารามิเตอร์ให้ปรับ จึงใช้เป็นเกณฑ์เทียบได้ดี")
 
     cmp_df = pd.DataFrame({
         "Train": [pct(m_tr["cagr"]), pct(m_tr["max_drawdown"]), round(m_tr["sharpe"], 2),
@@ -341,7 +359,7 @@ with tab_scan:
             try:
                 d_ = get_df(tk, start)
                 f_, mb_, _ = get_eval(tk, start, split, cost)
-                nm = auto_pick(f_) if strat_choice == "auto" else strat_choice
+                nm = strat_choice if strat_choice in f_ else auto_pick(f_)
                 ff = f_[nm]
                 act, _ = bt.current_action(ff["signal"])
                 rows.append({

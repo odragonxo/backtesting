@@ -45,7 +45,7 @@ def load_prices(ticker=None, start=None, csv=None):
     return _clean(df)
 
 
-# ---------- indicators / signals (1 = long, 0 = flat), computed from closes ----------
+# ---------- indicators / signals (1 = long, 0 = flat), computed from the CLOSE ----------
 def rsi(close, n):
     d = close.diff()
     up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
@@ -62,40 +62,172 @@ def atr(df, n=14):
     return tr.ewm(alpha=1 / n, adjust=False).mean()
 
 
-def sig_sma_cross(close, fast, slow):
-    return (close.rolling(fast).mean() > close.rolling(slow).mean()).astype(int)
+def macd_calc(close, fast, slow, sig):
+    m = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+    return m, m.ewm(span=sig, adjust=False).mean()
 
 
-def sig_breakout(close, n, exit_n):
-    """Enter on a new n-day closing high, exit on a new exit_n-day closing low."""
-    hi = close.rolling(n).max().shift(1)
-    lo = close.rolling(exit_n).min().shift(1)
-    pos = pd.Series(np.nan, index=close.index)
-    pos[close > hi] = 1
-    pos[close < lo] = 0
+def supertrend(df, n, mult):
+    """Classic Supertrend. Returns (trend series of +1/-1, trailing line)."""
+    h, l, c = df["High"].values, df["Low"].values, df["Close"].values
+    a = atr(df, n).values
+    hl2 = (h + l) / 2
+    ub, lb = hl2 + mult * a, hl2 - mult * a
+    k = len(c)
+    fub, flb, tr = np.full(k, np.nan), np.full(k, np.nan), np.ones(k)
+    start = n  # skip ATR warm-up
+    if k <= start:
+        return pd.Series(1, index=df.index), pd.Series(np.nan, index=df.index)
+    fub[start], flb[start] = ub[start], lb[start]
+    for i in range(start + 1, k):
+        fub[i] = ub[i] if (ub[i] < fub[i - 1] or c[i - 1] > fub[i - 1]) else fub[i - 1]
+        flb[i] = lb[i] if (lb[i] > flb[i - 1] or c[i - 1] < flb[i - 1]) else flb[i - 1]
+        if tr[i - 1] == 1 and c[i] < flb[i]:
+            tr[i] = -1
+        elif tr[i - 1] == -1 and c[i] > fub[i]:
+            tr[i] = 1
+        else:
+            tr[i] = tr[i - 1]
+    tr[:start] = 0
+    line = np.where(tr == 1, flb, fub)
+    return pd.Series(tr, index=df.index), pd.Series(line, index=df.index)
+
+
+def _stateful(index, buy, sell):
+    pos = pd.Series(np.nan, index=index)
+    pos[buy] = 1
+    pos[sell] = 0
     return pos.ffill().fillna(0).astype(int)
 
 
-def sig_rsi_revert(close, n, low, exit_level):
-    """Buy when RSI < low, sell when RSI > exit_level."""
-    r = rsi(close, n)
-    pos = pd.Series(np.nan, index=close.index)
-    pos[r < low] = 1
-    pos[r > exit_level] = 0
-    return pos.ffill().fillna(0).astype(int)
+def sig_sma_cross(df, fast, slow):
+    c = df["Close"]
+    return (c.rolling(fast).mean() > c.rolling(slow).mean()).astype(int)
 
 
+def sig_sma_filter(df, n):
+    """Long while price is above its n-day average (Faber-style trend filter)."""
+    c = df["Close"]
+    return (c > c.rolling(n).mean()).astype(int)
+
+
+def sig_tsmom(df, n):
+    """Time-series momentum: long while the n-day return is positive."""
+    c = df["Close"]
+    return (c / c.shift(n) - 1 > 0).astype(int)
+
+
+def sig_breakout(df, n, exit_n):
+    """Donchian-style: enter on a new n-day closing high, exit on a new exit_n-day low."""
+    c = df["Close"]
+    return _stateful(c.index, c > c.rolling(n).max().shift(1), c < c.rolling(exit_n).min().shift(1))
+
+
+def sig_macd(df, fast, slow, sig):
+    m, s_ = macd_calc(df["Close"], fast, slow, sig)
+    out = (m > s_).astype(int)
+    out.iloc[: slow * 2] = 0  # warm-up
+    return out
+
+
+def sig_supertrend(df, n, mult):
+    tr, _ = supertrend(df, n, mult)
+    return (tr == 1).astype(int)
+
+
+def sig_bollinger(df, n, k):
+    """Mean reversion: buy below the lower band, sell when price returns to the middle band."""
+    c = df["Close"]
+    mid, sd = c.rolling(n).mean(), c.rolling(n).std()
+    return _stateful(c.index, c < mid - k * sd, c > mid)
+
+
+def sig_rsi_revert(df, n, low, exit_level):
+    r = rsi(df["Close"], n)
+    return _stateful(df.index, r < low, r > exit_level)
+
+
+def vote_components(df):
+    """Fixed, NOT optimised rules (so there is nothing to overfit)."""
+    c = df["Close"]
+    v = {
+        "ราคา > SMA200": (c > c.rolling(200).mean()).astype(int),
+        "ผลตอบแทน 12 เดือน > 0": (c / c.shift(252) - 1 > 0).astype(int),
+        "MACD(12,26,9) > signal": sig_macd(df, 12, 26, 9),
+        "Breakout 100/50": sig_breakout(df, 100, 50),
+    }
+    if {"High", "Low"} <= set(df.columns):
+        v["Supertrend(10,3)"] = sig_supertrend(df, 10, 3.0)
+    return v
+
+
+def sig_trend_vote(df):
+    v = vote_components(df)
+    total = sum(v.values())
+    return (total * 2 > len(v)).astype(int)  # strict majority
+
+
+# name -> (function, param grid). Grids are kept small on purpose (less overfitting).
 STRATEGIES = {
     "sma_cross": (sig_sma_cross, {"fast": [10, 20, 50], "slow": [50, 100, 200]}),
+    "sma_filter": (sig_sma_filter, {"n": [50, 100, 150, 200]}),
+    "tsmom": (sig_tsmom, {"n": [63, 126, 252]}),
     "breakout": (sig_breakout, {"n": [20, 50, 100], "exit_n": [10, 20, 50]}),
+    "macd": (sig_macd, {"fast": [8, 12, 19], "slow": [21, 26, 39], "sig": [5, 9]}),
+    "supertrend": (sig_supertrend, {"n": [7, 10, 14], "mult": [2.0, 3.0, 4.0]}),
+    "bollinger": (sig_bollinger, {"n": [20, 50], "k": [2.0, 2.5]}),
     "rsi_revert": (sig_rsi_revert, {"n": [2, 14], "low": [10, 30], "exit_level": [50, 70]}),
+    "trend_vote": (lambda df: sig_trend_vote(df), {}),
 }
+NEEDS_HL = {"supertrend"}
 
 STRATEGY_LABELS = {
-    "sma_cross": "ตามเทรนด์ (SMA cross)",
-    "breakout": "เบรกเอาต์ (Breakout)",
-    "rsi_revert": "กลับตัว (RSI)",
+    "sma_cross": "ตามเทรนด์: SMA cross",
+    "sma_filter": "ตามเทรนด์: ราคาเหนือเส้นค่าเฉลี่ย",
+    "tsmom": "โมเมนตัมตามเวลา (Time-series momentum)",
+    "breakout": "เบรกเอาต์ (Donchian)",
+    "macd": "MACD",
+    "supertrend": "Supertrend (ATR)",
+    "bollinger": "กลับตัว: Bollinger Bands",
+    "rsi_revert": "กลับตัว: RSI",
+    "trend_vote": "โหวตหลายเทรนด์ (พารามิเตอร์คงที่)",
 }
+
+# (what it is, evidence / caveat)
+STRATEGY_INFO = {
+    "sma_cross": ("ซื้อเมื่อค่าเฉลี่ยเร็วตัดขึ้นเหนือค่าเฉลี่ยช้า ขายเมื่อกลับกัน",
+                  "ตามเทรนด์แบบคลาสสิก ได้ผลเมื่อมีเทรนด์ยาว แต่โดนหลอกบ่อยในตลาดไซด์เวย์"),
+    "sma_filter": ("ถือเมื่อราคาปิดอยู่เหนือค่าเฉลี่ย n วัน (เช่น 200 วัน) ไม่งั้นอยู่นอกตลาด",
+                   "แนวคิดจากงานของ Faber (2007) เรื่อง tactical asset allocation เทรดน้อย ค่าใช้จ่ายต่ำ "
+                   "ช่วยลด drawdown ในตลาดหมี แต่มักตามหลังตลาดในขาขึ้นแรง"),
+    "tsmom": ("ถือเมื่อผลตอบแทน n วันที่ผ่านมาเป็นบวก",
+              "อิงงาน Time series momentum (Moskowitz, Ooi, Pedersen 2012) ที่พบในหลายสินทรัพย์ "
+              "แต่ผลในอดีตไม่การันตีว่ายังได้ผลต่อ"),
+    "breakout": ("ซื้อเมื่อปิดทะลุสูงสุด n วัน ขายเมื่อหลุดต่ำสุด m วัน",
+                 "แนวคิด Donchian channel / Turtle Traders ชนะน้อยครั้งแต่ได้กำไรต่อครั้งใหญ่ "
+                 "ต้องทนแพ้ติดกันได้"),
+    "macd": ("ซื้อเมื่อเส้น MACD ตัดขึ้นเหนือเส้นสัญญาณ",
+             "ใช้แพร่หลายมาก แต่หลักฐานเชิงสถิติว่าชนะตลาดอย่างเสถียรค่อนข้างอ่อน "
+             "โดยพื้นฐานเป็นตัวตามเทรนด์ที่ตอบสนองเร็ว"),
+    "supertrend": ("เส้นตามหลังราคาโดยใช้ ATR ซื้อเมื่อราคาปิดเหนือเส้น ขายเมื่อหลุดเส้น",
+                   "เป็น trailing stop ที่ปรับตามความผันผวน ช่วยให้ถือเทรนด์ได้นาน แต่ถูกเขย่าออกในตลาดแกว่ง "
+                   "ต้องใช้ข้อมูล High/Low"),
+    "bollinger": ("ซื้อเมื่อราคาปิดต่ำกว่าแถบล่าง ขายเมื่อกลับมาถึงเส้นกลาง",
+                  "เป็นกลยุทธ์กลับตัว เหมาะตลาดแกว่งกรอบ แต่กับหุ้นเทรนด์แรงอย่างหุ้นเทค "
+                  "อาจซื้อตอนราคายังร่วงต่อ ควรเทียบผลกับ buy & hold ให้ดี"),
+    "rsi_revert": ("ซื้อเมื่อ RSI ต่ำมาก ขายเมื่อ RSI กลับมาสูง",
+                   "แนวคิดกลับตัวระยะสั้นแบบ RSI(2) ของ Connors เทรดถี่ ต้นทุนมีผลมาก "
+                   "และเสี่ยงโดนล้างเมื่อราคาตกต่อเนื่อง"),
+    "trend_vote": ("รวมกฎเทรนด์ 4-5 ข้อ (SMA200, โมเมนตัม 12 เดือน, MACD, Breakout, Supertrend) "
+                   "แล้วถือเมื่อเสียงข้างมากเป็นซื้อ",
+                   "ไม่มีพารามิเตอร์ให้ปรับ จึงเสี่ยง overfit น้อยที่สุดในกลุ่ม และมักนิ่งกว่าตัวเดี่ยว "
+                   "เป็นจุดเริ่มต้นที่สมเหตุสมผลสำหรับตั้งเป็นเกณฑ์อ้างอิง"),
+}
+
+
+def available_strategies(df):
+    has_hl = {"High", "Low"} <= set(df.columns)
+    return [n for n in STRATEGIES if has_hl or n not in NEEDS_HL]
 
 
 def param_grid(space):
@@ -185,7 +317,7 @@ def fit_strategy(df, split, name, cost):
     train = df[df.index < split]
     best, best_s = None, -np.inf
     for p in param_grid(space):
-        sig = fn(train["Close"], **p)
+        sig = fn(train, **p)
         d, _ = run(train, sig, cost)
         s = metrics(d).get("sharpe", -np.inf)
         if len(trade_log(train, sig, cost)) < MIN_TRAIN_TRADES:
@@ -193,7 +325,7 @@ def fit_strategy(df, split, name, cost):
         if s > best_s:
             best, best_s = p, s
 
-    signal = fn(df["Close"], **best)  # indicators warmed up on full history
+    signal = fn(df, **best)  # indicators warmed up on full history
     daily, pos = run(df, signal, cost)
     trades = trade_log(df, signal, cost)
     tr_mask, te_mask = daily.index < split, daily.index >= split
@@ -206,7 +338,7 @@ def fit_strategy(df, split, name, cost):
 def evaluate(df, split, cost):
     """Returns ({strategy: fit}, buy_hold_test_metrics, buy_hold_daily)."""
     split = pd.Timestamp(split)
-    fits = {n: fit_strategy(df, split, n, cost) for n in STRATEGIES}
+    fits = {n: fit_strategy(df, split, n, cost) for n in available_strategies(df)}
     bh = df["Close"].pct_change().fillna(0)
     bh_te = bh[bh.index >= split]
     m_bh = metrics(bh_te, pd.Series(1.0, index=bh_te.index), None)
@@ -226,26 +358,78 @@ def current_action(signal):
     return "WAIT", "อยู่นอกตลาด รอสัญญาณซื้อ"
 
 
-def trigger_levels(name, params, close):
+def trigger_levels(name, params, df):
     """Human-readable distance to the next signal change, based on the latest close."""
+    close = df["Close"]
     last = float(close.iloc[-1])
     out = []
     if name == "sma_cross":
-        f, s = close.rolling(params["fast"]).mean().iloc[-1], close.rolling(params["slow"]).mean().iloc[-1]
-        out.append((f"SMA{params['fast']} (เร็ว)", f"{f:,.2f}"))
-        out.append((f"SMA{params['slow']} (ช้า)", f"{s:,.2f}"))
-        out.append(("ช่องว่างเร็ว-ช้า", f"{(f / s - 1) * 100:+.2f}%  (ซื้อเมื่อ > 0)"))
+        f, s_ = close.rolling(params["fast"]).mean().iloc[-1], close.rolling(params["slow"]).mean().iloc[-1]
+        out += [(f"SMA{params['fast']} (เร็ว)", f"{f:,.2f}"), (f"SMA{params['slow']} (ช้า)", f"{s_:,.2f}"),
+                ("ช่องว่างเร็ว-ช้า", f"{(f / s_ - 1) * 100:+.2f}%  (ซื้อเมื่อ > 0)")]
+    elif name == "sma_filter":
+        m = close.rolling(params["n"]).mean().iloc[-1]
+        out += [(f"SMA{params['n']}", f"{m:,.2f}"),
+                ("ราคาห่างจากเส้น", f"{(last / m - 1) * 100:+.2f}%  (ถือเมื่อ > 0)")]
+    elif name == "tsmom":
+        n = params["n"]
+        ref = float(close.iloc[-n])
+        out += [(f"ผลตอบแทน {n} วัน", f"{(last / close.iloc[-n - 1] - 1) * 100:+.1f}%  (ถือเมื่อ > 0)"),
+                ("ราคาปิดพรุ่งนี้ต้องสูงกว่า (เพื่อคงสถานะบวก)", f"{ref:,.2f}")]
     elif name == "breakout":
-        up = close.iloc[-params["n"]:].max()
-        dn = close.iloc[-params["exit_n"]:].min()
-        out.append((f"ราคาปิดเหนือ (สูงสุด {params['n']} วัน) = ซื้อ", f"{up:,.2f}  ({(up / last - 1) * 100:+.1f}% จากราคาปิดล่าสุด)"))
-        out.append((f"ราคาปิดต่ำกว่า (ต่ำสุด {params['exit_n']} วัน) = ขาย", f"{dn:,.2f}  ({(dn / last - 1) * 100:+.1f}%)"))
+        up, dn = close.iloc[-params["n"]:].max(), close.iloc[-params["exit_n"]:].min()
+        out += [(f"ปิดเหนือสูงสุด {params['n']} วัน = ซื้อ", f"{up:,.2f}  ({(up / last - 1) * 100:+.1f}% จากราคาปิด)"),
+                (f"ปิดต่ำกว่าต่ำสุด {params['exit_n']} วัน = ขาย", f"{dn:,.2f}  ({(dn / last - 1) * 100:+.1f}%)")]
+    elif name == "macd":
+        m, s_ = macd_calc(close, params["fast"], params["slow"], params["sig"])
+        out += [("MACD", f"{m.iloc[-1]:.3f}"), ("เส้นสัญญาณ", f"{s_.iloc[-1]:.3f}"),
+                ("Histogram", f"{m.iloc[-1] - s_.iloc[-1]:+.3f}  (ซื้อเมื่อ > 0)")]
+    elif name == "supertrend":
+        tr, line = supertrend(df, params["n"], params["mult"])
+        ln = float(line.iloc[-1])
+        out += [("เทรนด์ปัจจุบัน", "ขาขึ้น" if tr.iloc[-1] == 1 else "ขาลง"),
+                ("เส้น Supertrend", f"{ln:,.2f}  ({(ln / last - 1) * 100:+.1f}% จากราคาปิด)"),
+                ("กติกา", "ปิดหลุดเส้นขณะขาขึ้น = ขาย · ปิดเหนือเส้นขณะขาลง = ซื้อ")]
+    elif name == "bollinger":
+        mid, sd = close.rolling(params["n"]).mean().iloc[-1], close.rolling(params["n"]).std().iloc[-1]
+        lo = mid - params["k"] * sd
+        out += [("แถบล่าง (ซื้อเมื่อปิดต่ำกว่า)", f"{lo:,.2f}  ({(lo / last - 1) * 100:+.1f}%)"),
+                ("เส้นกลาง (ขายเมื่อปิดสูงกว่า)", f"{mid:,.2f}  ({(mid / last - 1) * 100:+.1f}%)"),
+                ("หมายเหตุ", "ระดับแถบเป็นค่าโดยประมาณ จะขยับตามราคาวันถัดไป")]
     elif name == "rsi_revert":
         r = rsi(close, params["n"]).iloc[-1]
-        out.append((f"RSI({params['n']}) ล่าสุด", f"{r:.1f}"))
-        out.append(("ซื้อเมื่อ RSI ต่ำกว่า", f"{params['low']}"))
-        out.append(("ขายเมื่อ RSI สูงกว่า", f"{params['exit_level']}"))
+        out += [(f"RSI({params['n']}) ล่าสุด", f"{r:.1f}"), ("ซื้อเมื่อ RSI ต่ำกว่า", f"{params['low']}"),
+                ("ขายเมื่อ RSI สูงกว่า", f"{params['exit_level']}")]
+    elif name == "trend_vote":
+        v = vote_components(df)
+        for k, ser in v.items():
+            out.append((k, "✅ ซื้อ" if ser.iloc[-1] == 1 else "❌ ไม่ซื้อ"))
+        out.append(("รวม", f"{sum(int(x.iloc[-1]) for x in v.values())}/{len(v)} (ถือเมื่อเกินครึ่ง)"))
     return out
+
+
+def overlay_lines(name, params, df):
+    """Lines to draw on the price chart: list of (label, series, color, dash)."""
+    c = df["Close"]
+    if name == "sma_cross":
+        return [(f"SMA{params['fast']}", c.rolling(params["fast"]).mean(), "blue", None),
+                (f"SMA{params['slow']}", c.rolling(params["slow"]).mean(), "orange", None)]
+    if name == "sma_filter":
+        return [(f"SMA{params['n']}", c.rolling(params["n"]).mean(), "orange", None)]
+    if name == "breakout":
+        return [(f"สูงสุด {params['n']} วัน (ซื้อ)", c.rolling(params["n"]).max().shift(1), "green", "dot"),
+                (f"ต่ำสุด {params['exit_n']} วัน (ขาย)", c.rolling(params["exit_n"]).min().shift(1), "red", "dot")]
+    if name == "bollinger":
+        mid, sd = c.rolling(params["n"]).mean(), c.rolling(params["n"]).std()
+        return [("แถบบน", mid + params["k"] * sd, "grey", "dot"), ("เส้นกลาง (ขาย)", mid, "orange", None),
+                ("แถบล่าง (ซื้อ)", mid - params["k"] * sd, "green", "dot")]
+    if name == "supertrend":
+        tr, line = supertrend(df, params["n"], params["mult"])
+        return [("Supertrend ขาขึ้น", line.where(tr == 1), "green", None),
+                ("Supertrend ขาลง", line.where(tr == -1), "red", None)]
+    if name == "trend_vote":
+        return [("SMA200", c.rolling(200).mean(), "orange", None)]
+    return []  # tsmom, macd, rsi_revert: nothing on the price panel
 
 
 # ---------- CLI ----------
