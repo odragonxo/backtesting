@@ -36,9 +36,14 @@ def get_eval(ticker, start, split, cost):
     return fits, m_bh, bh
 
 
-def auto_pick(fits):
-    """Best TRAIN Sharpe (never pick by test results - that would be peeking)."""
-    return max(fits, key=lambda n: fits[n]["train"].get("sharpe", -9))
+def in_group(n, group):
+    return group == "all" or bt.STRATEGY_GROUP[n] == group
+
+
+def auto_pick(fits, group="all"):
+    """Best TRAIN Sharpe within the style group (never pick by test results - that would be peeking)."""
+    pool = [n for n in fits if in_group(n, group)] or list(fits)
+    return max(pool, key=lambda n: fits[n]["train"].get("sharpe", -9))
 
 
 # ---------- sidebar ----------
@@ -51,8 +56,10 @@ with st.sidebar:
     c1, c2 = st.columns(2)
     fee = c1.number_input("คอมมิชชัน/ข้าง (%)", 0.0, 2.0, 0.10, 0.01) / 100
     slip = c2.number_input("สลิปเพจ/ข้าง (%)", 0.0, 2.0, 0.05, 0.01) / 100
+    st.caption("เทรดสั้นเทรดถี่ ต้นทุนกินกำไรง่าย ใส่ค่าคอมมิชชันและสลิปเพจให้ตรงกับโบรกเกอร์จริง")
+    group = st.radio("สไตล์การเทรด", list(bt.GROUP_LABELS), format_func=lambda g: bt.GROUP_LABELS[g])
     strat_choice = st.selectbox(
-        "กลยุทธ์", ["auto"] + list(bt.STRATEGIES),
+        "กลยุทธ์", ["auto"] + [n for n in bt.STRATEGIES if in_group(n, group)],
         format_func=lambda x: "อัตโนมัติ (Sharpe ช่วง Train ดีสุด)" if x == "auto" else LABEL[x])
 
     st.header("จัดการความเสี่ยง")
@@ -79,7 +86,7 @@ except Exception as e:
 
 if strat_choice != "auto" and strat_choice not in fits:
     st.warning(f"{LABEL[strat_choice]} ใช้ไม่ได้กับข้อมูลชุดนี้ (ต้องมี High/Low) จึงใช้โหมดอัตโนมัติแทน")
-name = strat_choice if strat_choice in fits else auto_pick(fits)
+name = strat_choice if strat_choice in fits else auto_pick(fits, group)
 fit = fits[name]
 close = df["Close"]
 last_date, last_close = close.index[-1], float(close.iloc[-1])
@@ -118,6 +125,11 @@ with tab_sig:
         m2.metric("สถานะ", "ถืออยู่")
         m3.metric("ราคาเข้า", f"{t['entry_price']:,.2f}", f"{(last_close / t['entry_price'] - 1) * 100:+.1f}%")
         m4.metric("ถือมาแล้ว", f"{int(t['days'])} วัน")
+        if "max_hold" in fit["params"]:
+            held = int((df.index >= t["entry_date"]).sum())
+            mh = fit["params"]["max_hold"]
+            st.info(f"⏱️ Time stop: ถือมาแล้ว {held}/{mh} วันทำการ — ครบกำหนดแล้วระบบจะให้สัญญาณขายเอง "
+                    "แม้ยังไม่ถึงจุดออกตามราคา")
     else:
         m2.metric("สถานะ", "ไม่ได้ถือ")
         if len(trades):
@@ -218,14 +230,25 @@ with tab_chart:
                       row=2, col=1)
         fig.add_trace(go.Scatter(x=sg_.index, y=sg_.values, name="Signal", line=dict(color=ORANGE, width=1.3)),
                       row=2, col=1)
+    elif name == "ibs":
+        iv = bt.ibs(df).reindex(view.index)
+        fig.add_trace(go.Scatter(x=iv.index, y=iv.values, name="IBS", mode="lines",
+                                 line=dict(color="#ab47bc", width=1)), row=2, col=1)
+        fig.add_hline(y=p["low"], line_dash="dot", line_color=GREEN, row=2, col=1)
+        fig.update_yaxes(range=[0, 1], row=2, col=1)
     else:
-        rn = p["n"] if name == "rsi_revert" else 14
+        if name == "rsi_revert":
+            rn, lo, hi = p["n"], p["low"], p["exit_level"]
+        elif name == "rsi2_trend":
+            rn, lo, hi = 2, p["low"], None
+        else:
+            rn, lo, hi = 14, 30, 70
         r = bt.rsi(close, rn).reindex(view.index)
         fig.add_trace(go.Scatter(x=r.index, y=r.values, name=f"RSI({rn})", line=dict(color="#ab47bc", width=1.3)),
                       row=2, col=1)
-        lo, hi = (p["low"], p["exit_level"]) if name == "rsi_revert" else (30, 70)
         fig.add_hline(y=lo, line_dash="dot", line_color=GREEN, row=2, col=1)
-        fig.add_hline(y=hi, line_dash="dot", line_color=RED, row=2, col=1)
+        if hi is not None:
+            fig.add_hline(y=hi, line_dash="dot", line_color=RED, row=2, col=1)
         fig.update_yaxes(range=[0, 100], row=2, col=1)
 
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
@@ -248,12 +271,13 @@ with tab_res:
             "ผลตอบแทนรวม": pct(m["total_return"]), "CAGR": pct(m["cagr"]),
             "Max drawdown": pct(m["max_drawdown"]), "Sharpe": round(m["sharpe"], 2),
             "เวลาอยู่ในตลาด": pct(m["time_in_market"], 0), "จำนวนเทรด": m["trades"],
+            "ถือเฉลี่ย (วัน)": round(m["avg_days"], 1),
             "Win rate": pct(m["win_rate"], 0), "กำไรเฉลี่ย/เทรด": pct(m["expectancy"]),
             "Profit factor": "∞" if np.isinf(m["profit_factor"]) else round(m["profit_factor"], 2)})
     rows.append({
         "กลยุทธ์": "ซื้อถือ (buy & hold)", "ผลตอบแทนรวม": pct(m_bh["total_return"]),
         "CAGR": pct(m_bh["cagr"]), "Max drawdown": pct(m_bh["max_drawdown"]),
-        "Sharpe": round(m_bh["sharpe"], 2), "เวลาอยู่ในตลาด": "100%", "จำนวนเทรด": "-",
+        "Sharpe": round(m_bh["sharpe"], 2), "เวลาอยู่ในตลาด": "100%", "จำนวนเทรด": "-", "ถือเฉลี่ย (วัน)": "-",
         "Win rate": "-", "กำไรเฉลี่ย/เทรด": "-", "Profit factor": "-"})
     st.dataframe(pd.DataFrame(rows), hide_index=True)
 
@@ -281,6 +305,18 @@ with tab_res:
     }, index=["CAGR", "Max drawdown", "Sharpe", "จำนวนเทรด", "Win rate", "กำไรเฉลี่ย/เทรด"])
     st.markdown("**เทียบ Train กับ Test ของกลยุทธ์ที่เลือก** (ต่างกันมาก = สัญญาณว่าอาจ overfit)")
     st.dataframe(cmp_df)
+
+    st.markdown("**ทดสอบความทนต่อต้นทุน** (ช่วง Test, ใช้สัญญาณเดิม แต่ค่าธรรมเนียม+สลิปเพจสูงขึ้น)")
+    cs = bt.cost_stress(df, fit, split, cost)
+    cs_show = pd.DataFrame({
+        "ต้นทุนต่อข้าง": [f"{v:.2f}%  ({int(k)}x)" for v, k in zip(cs["cost_pct"], cs["mult"])],
+        "ผลตอบแทนรวม": [pct(v) for v in cs["total_return"]],
+        "CAGR": [pct(v) for v in cs["cagr"]],
+        "Sharpe": cs["sharpe"].round(2),
+        "กำไรเฉลี่ย/เทรด": [pct(v, 2) for v in cs["expectancy"]]})
+    st.dataframe(cs_show, hide_index=True)
+    st.caption("ถ้ากำไรหายหรือ Sharpe ติดลบเมื่อต้นทุนเพิ่มแค่ 2 เท่า แปลว่ากลยุทธ์บางเกินไปสำหรับใช้จริง "
+               "โดยเฉพาะกลยุทธ์เทรดสั้นที่เทรดถี่")
 
     te = fit["trades"][fit["trades"]["entry_date"] >= pd.Timestamp(split)]
     if len(te):
@@ -359,7 +395,7 @@ with tab_scan:
             try:
                 d_ = get_df(tk, start)
                 f_, mb_, _ = get_eval(tk, start, split, cost)
-                nm = strat_choice if strat_choice in f_ else auto_pick(f_)
+                nm = strat_choice if strat_choice in f_ else auto_pick(f_, group)
                 ff = f_[nm]
                 act, _ = bt.current_action(ff["signal"])
                 rows.append({

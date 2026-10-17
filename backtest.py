@@ -100,6 +100,63 @@ def _stateful(index, buy, sell):
     return pos.ffill().fillna(0).astype(int)
 
 
+def _timed(index, buy, sell, max_hold):
+    """Like _stateful, plus a TIME STOP: force an exit after max_hold bars.
+    Signal at close i -> position from the next open. Held ~= max_hold trading days."""
+    b, x = buy.fillna(False).values, sell.fillna(False).values
+    pos, cur, held = np.zeros(len(index), dtype=int), 0, 0
+    for i in range(len(index)):
+        if cur == 0:
+            if b[i]:
+                cur, held = 1, 0
+        else:
+            held += 1
+            if x[i] or held >= max_hold:
+                cur = 0
+        pos[i] = cur
+    return pd.Series(pos, index=index)
+
+
+def ibs(df):
+    """Internal Bar Strength: where the close sits inside the day's range (0 = low, 1 = high)."""
+    rng = (df["High"] - df["Low"]).replace(0, np.nan)
+    return (df["Close"] - df["Low"]) / rng
+
+
+def sig_rsi2_trend(df, low, trend_n, max_hold):
+    """Short-term pullback in an uptrend: RSI(2) very low while above the long SMA; exit above SMA5."""
+    c = df["Close"]
+    return _timed(c.index, (rsi(c, 2) < low) & (c > c.rolling(trend_n).mean()),
+                  c > c.rolling(5).mean(), max_hold)
+
+
+def sig_ibs(df, low, max_hold, trend):
+    """Buy a weak close (IBS low), sell when price closes above the prior day's high."""
+    c = df["Close"]
+    ok = (c > c.rolling(trend).mean()) if trend else pd.Series(True, index=c.index)
+    return _timed(c.index, (ibs(df) < low) & ok, c > df["High"].shift(1), max_hold)
+
+
+def sig_pullback_low(df, n, max_hold):
+    """Buy an n-day closing low while above SMA200; exit when price recovers above SMA5."""
+    c = df["Close"]
+    return _timed(c.index, (c <= c.rolling(n).min()) & (c > c.rolling(200).mean()),
+                  c > c.rolling(5).mean(), max_hold)
+
+
+def sig_short_breakout(df, n, exit_n, max_hold):
+    """Short-term breakout: new n-day closing high, exit on exit_n-day low or time stop."""
+    c = df["Close"]
+    return _timed(c.index, c > c.rolling(n).max().shift(1), c < c.rolling(exit_n).min().shift(1), max_hold)
+
+
+def sig_boll_pull(df, k, max_hold):
+    """Bollinger(20) lower-band dip inside an uptrend (above SMA200); exit at the middle band."""
+    c = df["Close"]
+    mid, sd = c.rolling(20).mean(), c.rolling(20).std()
+    return _timed(c.index, (c < mid - k * sd) & (c > c.rolling(200).mean()), c > mid, max_hold)
+
+
 def sig_sma_cross(df, fast, slow):
     c = df["Close"]
     return (c.rolling(fast).mean() > c.rolling(slow).mean()).astype(int)
@@ -178,8 +235,21 @@ STRATEGIES = {
     "bollinger": (sig_bollinger, {"n": [20, 50], "k": [2.0, 2.5]}),
     "rsi_revert": (sig_rsi_revert, {"n": [2, 14], "low": [10, 30], "exit_level": [50, 70]}),
     "trend_vote": (lambda df: sig_trend_vote(df), {}),
+    # --- short-term / swing (hold a few days; time stop built in) ---
+    "rsi2_trend": (sig_rsi2_trend, {"low": [5, 10, 20], "trend_n": [100, 200], "max_hold": [5, 10]}),
+    "ibs": (sig_ibs, {"low": [0.1, 0.2, 0.3], "max_hold": [3, 5, 10], "trend": [0, 200]}),
+    "pullback_low": (sig_pullback_low, {"n": [3, 5, 7], "max_hold": [5, 10]}),
+    "short_breakout": (sig_short_breakout, {"n": [5, 10, 20], "exit_n": [3, 5], "max_hold": [10, 20]}),
+    "boll_pull": (sig_boll_pull, {"k": [1.5, 2.0], "max_hold": [5, 10]}),
 }
-NEEDS_HL = {"supertrend"}
+NEEDS_HL = {"supertrend", "ibs"}
+
+# group: "trend" = long holds, "swing" = short holds
+STRATEGY_GROUP = {n: "trend" for n in ["sma_cross", "sma_filter", "tsmom", "breakout", "macd",
+                                       "supertrend", "trend_vote"]}
+STRATEGY_GROUP.update({n: "swing" for n in ["bollinger", "rsi_revert", "rsi2_trend", "ibs",
+                                            "pullback_low", "short_breakout", "boll_pull"]})
+GROUP_LABELS = {"all": "ทั้งหมด", "trend": "เทรนด์ (ถือยาว)", "swing": "เทรดสั้น (swing ถือไม่กี่วัน)"}
 
 STRATEGY_LABELS = {
     "sma_cross": "ตามเทรนด์: SMA cross",
@@ -191,6 +261,11 @@ STRATEGY_LABELS = {
     "bollinger": "กลับตัว: Bollinger Bands",
     "rsi_revert": "กลับตัว: RSI",
     "trend_vote": "โหวตหลายเทรนด์ (พารามิเตอร์คงที่)",
+    "rsi2_trend": "สั้น: RSI(2) ย่อตัวในขาขึ้น",
+    "ibs": "สั้น: IBS ปิดอ่อนแรง",
+    "pullback_low": "สั้น: ซื้อย่อที่ต่ำสุด n วัน",
+    "short_breakout": "สั้น: เบรกเอาต์ระยะสั้น",
+    "boll_pull": "สั้น: Bollinger ย่อตัวในขาขึ้น",
 }
 
 # (what it is, evidence / caveat)
@@ -222,6 +297,22 @@ STRATEGY_INFO = {
                    "แล้วถือเมื่อเสียงข้างมากเป็นซื้อ",
                    "ไม่มีพารามิเตอร์ให้ปรับ จึงเสี่ยง overfit น้อยที่สุดในกลุ่ม และมักนิ่งกว่าตัวเดี่ยว "
                    "เป็นจุดเริ่มต้นที่สมเหตุสมผลสำหรับตั้งเป็นเกณฑ์อ้างอิง"),
+    "rsi2_trend": ("ซื้อเมื่อ RSI(2) ต่ำมากขณะราคายังอยู่เหนือ SMA ยาว ขายเมื่อปิดเหนือ SMA5 หรือถือครบกำหนด",
+                   "แนวคิดจากหนังสือ Short Term Trading Strategies That Work (Connors & Alvarez 2008) "
+                   "หลักฐานส่วนใหญ่มาจากดัชนีและหุ้นใหญ่ในอดีต ข้อได้เปรียบอาจลดลงแล้ว "
+                   "และต้นทุนต่อเทรดมีผลมาก"),
+    "ibs": ("ซื้อเมื่อราคาปิดใกล้ราคาต่ำสุดของวัน (IBS ต่ำ) ขายเมื่อปิดเหนือราคาสูงสุดของวันก่อน",
+            "เป็นกลยุทธ์กลับตัวที่นักเทรดเชิงปริมาณใช้ ส่วนใหญ่ทดสอบกับดัชนีและ ETF "
+            "กับหุ้นเดี่ยวที่เทรนด์แรงหลักฐานน้อยกว่า ต้องมีข้อมูล High/Low"),
+    "pullback_low": ("ซื้อเมื่อราคาปิดต่ำสุดในรอบ n วันขณะที่ยังอยู่เหนือ SMA200 ขายเมื่อฟื้นเหนือ SMA5 หรือถือครบกำหนด",
+                     "ซื้อย่อในขาขึ้นแบบ swing ได้ผลดีเมื่อเทรนด์ใหญ่ยังอยู่ "
+                     "แต่ถ้าเทรนด์เปลี่ยนจะซื้อตอนราคายังร่วง"),
+    "short_breakout": ("ซื้อเมื่อปิดทะลุสูงสุด n วัน (สั้น) ขายเมื่อหลุดต่ำสุด m วันหรือถือครบกำหนด",
+                       "เป็นการตามโมเมนตัมระยะสั้น มีสัญญาณหลอกเยอะและเทรดถี่ "
+                       "ค่าธรรมเนียมและสลิปเพจกินกำไรง่าย"),
+    "boll_pull": ("ซื้อเมื่อราคาปิดหลุดแถบล่าง Bollinger ขณะอยู่เหนือ SMA200 ขายเมื่อกลับถึงเส้นกลางหรือถือครบกำหนด",
+                  "เวอร์ชันมีฟิลเตอร์เทรนด์และจำกัดเวลาถือ ของกลยุทธ์ Bollinger ตัวเดิม "
+                  "ลดความเสี่ยงซื้อตอนเทรนด์ลง แต่ยังเป็นการสวนราคาระยะสั้น"),
 }
 
 
@@ -307,6 +398,7 @@ def metrics(daily, pos=None, trades=None):
         m["avg_win"] = float(wins.mean()) if len(wins) else 0.0
         m["avg_loss"] = float(losses.mean()) if len(losses) and len(trades) else 0.0
         m["profit_factor"] = float(wins.sum() / abs(losses.sum())) if losses.sum() != 0 else np.inf
+        m["avg_days"] = float(trades["days"].mean()) if len(trades) else 0.0  # calendar days
     return m
 
 
@@ -343,6 +435,20 @@ def evaluate(df, split, cost):
     bh_te = bh[bh.index >= split]
     m_bh = metrics(bh_te, pd.Series(1.0, index=bh_te.index), None)
     return fits, m_bh, bh
+
+
+def cost_stress(df, fit, split, cost, mults=(1, 2, 3)):
+    """Re-run the chosen strategy's test period with higher per-side costs."""
+    split = pd.Timestamp(split)
+    rows = []
+    for k in mults:
+        d, pos = run(df, fit["signal"], cost * k)
+        tl = trade_log(df, fit["signal"], cost * k)
+        te = d.index >= split
+        m = metrics(d[te], pos[te], tl[tl["entry_date"] >= split])
+        rows.append({"mult": k, "cost_pct": cost * k * 100, "cagr": m["cagr"], "sharpe": m["sharpe"],
+                     "expectancy": m["expectancy"], "total_return": m["total_return"]})
+    return pd.DataFrame(rows)
 
 
 def current_action(signal):
@@ -400,6 +506,34 @@ def trigger_levels(name, params, df):
         r = rsi(close, params["n"]).iloc[-1]
         out += [(f"RSI({params['n']}) ล่าสุด", f"{r:.1f}"), ("ซื้อเมื่อ RSI ต่ำกว่า", f"{params['low']}"),
                 ("ขายเมื่อ RSI สูงกว่า", f"{params['exit_level']}")]
+    elif name in ("rsi2_trend", "pullback_low", "boll_pull", "ibs", "short_breakout"):
+        sma5 = close.rolling(5).mean().iloc[-1]
+        tn = params.get("trend_n", 200 if name != "ibs" else params.get("trend", 0))
+        if name == "rsi2_trend":
+            out.append(("RSI(2) ล่าสุด", f"{rsi(close, 2).iloc[-1]:.1f}  (ซื้อเมื่อ < {params['low']})"))
+        elif name == "pullback_low":
+            lvl = close.iloc[-(params["n"] - 1):].min()
+            out.append((f"ซื้อเมื่อปิดไม่สูงกว่า (ต่ำสุด {params['n']} วัน)", f"{lvl:,.2f}  ({(lvl / last - 1) * 100:+.1f}%)"))
+        elif name == "boll_pull":
+            mid, sd = close.rolling(20).mean().iloc[-1], close.rolling(20).std().iloc[-1]
+            lo = mid - params["k"] * sd
+            out += [("แถบล่าง (ซื้อเมื่อปิดต่ำกว่า)", f"{lo:,.2f}  ({(lo / last - 1) * 100:+.1f}%)"),
+                    ("เส้นกลาง (ขายเมื่อปิดสูงกว่า)", f"{mid:,.2f}  ({(mid / last - 1) * 100:+.1f}%)")]
+        elif name == "ibs":
+            cur = ibs(df).iloc[-1]
+            out += [("IBS ล่าสุด", f"{cur:.2f}  (ซื้อเมื่อ < {params['low']})"),
+                    ("ขายเมื่อปิดเหนือ (สูงสุดของวันล่าสุด)", f"{df['High'].iloc[-1]:,.2f}")]
+        elif name == "short_breakout":
+            up, dn = close.iloc[-params["n"]:].max(), close.iloc[-params["exit_n"]:].min()
+            out += [(f"ปิดเหนือสูงสุด {params['n']} วัน = ซื้อ", f"{up:,.2f}  ({(up / last - 1) * 100:+.1f}%)"),
+                    (f"ปิดต่ำกว่าต่ำสุด {params['exit_n']} วัน = ขาย", f"{dn:,.2f}  ({(dn / last - 1) * 100:+.1f}%)")]
+        if name in ("rsi2_trend", "pullback_low", "boll_pull") or (name == "ibs" and tn):
+            n_ = 200 if name in ("pullback_low", "boll_pull") else tn
+            ma = close.rolling(n_).mean().iloc[-1]
+            out.append((f"ฟิลเตอร์เทรนด์: ราคา > SMA{n_}", f"{'✅ ผ่าน' if last > ma else '❌ ไม่ผ่าน'} (SMA{n_} = {ma:,.2f})"))
+        if name in ("rsi2_trend", "pullback_low"):
+            out.append(("ขายเมื่อปิดเหนือ SMA5", f"{sma5:,.2f}  ({(sma5 / last - 1) * 100:+.1f}%)"))
+        out.append(("ถือสูงสุด (time stop)", f"{params['max_hold']} วันทำการ แล้วออกอัตโนมัติ"))
     elif name == "trend_vote":
         v = vote_components(df)
         for k, ser in v.items():
@@ -429,6 +563,20 @@ def overlay_lines(name, params, df):
                 ("Supertrend ขาลง", line.where(tr == -1), "red", None)]
     if name == "trend_vote":
         return [("SMA200", c.rolling(200).mean(), "orange", None)]
+    if name in ("rsi2_trend", "pullback_low"):
+        tn = params.get("trend_n", 200)
+        return [(f"SMA{tn} (ฟิลเตอร์เทรนด์)", c.rolling(tn).mean(), "orange", None),
+                ("SMA5 (จุดออก)", c.rolling(5).mean(), "blue", "dot")]
+    if name == "ibs":
+        return [(f"SMA{params['trend']} (ฟิลเตอร์เทรนด์)", c.rolling(params["trend"]).mean(), "orange", None)] \
+            if params["trend"] else []
+    if name == "boll_pull":
+        mid, sd = c.rolling(20).mean(), c.rolling(20).std()
+        return [("แถบล่าง (ซื้อ)", mid - params["k"] * sd, "green", "dot"), ("เส้นกลาง (ขาย)", mid, "blue", "dot"),
+                ("SMA200", c.rolling(200).mean(), "orange", None)]
+    if name == "short_breakout":
+        return [(f"สูงสุด {params['n']} วัน (ซื้อ)", c.rolling(params["n"]).max().shift(1), "green", "dot"),
+                (f"ต่ำสุด {params['exit_n']} วัน (ขาย)", c.rolling(params["exit_n"]).min().shift(1), "red", "dot")]
     return []  # tsmom, macd, rsi_revert: nothing on the price panel
 
 
