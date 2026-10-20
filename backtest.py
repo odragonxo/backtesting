@@ -747,6 +747,45 @@ def fit_strategy(df, split, name, cost):
             "trades": trades, "train": m_tr, "test": m_te, "state": state}
 
 
+def fit_from_signal(df, signal, split, cost, name="custom", params=None):
+    """Same result shape as fit_strategy, but for a ready-made 0/1 signal (no parameter search)."""
+    split = pd.Timestamp(split)
+    daily, pos = run(df, signal, cost)
+    trades = trade_log(df, signal, cost)
+    tr_mask, te_mask = daily.index < split, daily.index >= split
+    return {"name": name, "params": params or {}, "signal": signal, "daily": daily, "pos": pos, "trades": trades,
+            "train": metrics(daily[tr_mask], pos[tr_mask], trades[trades["entry_date"] < split]),
+            "test": metrics(daily[te_mask], pos[te_mask], trades[trades["entry_date"] >= split]), "state": None}
+
+
+def trade_pnl(trades, capital, alloc=1.0, compound=True):
+    """Money P/L per trade. alloc = share of the balance put into each trade; compound=False always sizes
+    from the starting capital. `return` is already net of fees/slippage. An open trade shows unrealised P/L."""
+    t = trades.copy().reset_index(drop=True)
+    bal, rows = float(capital), []
+    for r in t["return"].values:
+        invest = min((bal if compound else capital) * alloc, bal)
+        pnl = invest * r
+        bal += pnl
+        rows.append((invest, pnl, bal))
+    t["invested"] = [x[0] for x in rows]
+    t["pnl"] = [x[1] for x in rows]
+    t["balance"] = [x[2] for x in rows]
+    return t
+
+
+def capital_summary(trades, close, start, capital, alloc=1.0, compound=True):
+    """What would `capital` have become from `start` following the trades, versus just holding."""
+    start = pd.Timestamp(start)
+    p = trade_pnl(trades[trades["entry_date"] >= start], capital, alloc, compound)
+    final = float(p["balance"].iloc[-1]) if len(p) else float(capital)
+    c = close[close.index >= start]
+    bh = float(capital * c.iloc[-1] / c.iloc[0]) if len(c) > 1 else float(capital)
+    return {"final": final, "pnl": final - capital, "bh_final": bh, "bh_pnl": bh - capital, "n": len(p),
+            "wins": int((p["pnl"] > 0).sum()) if len(p) else 0,
+            "best": float(p["pnl"].max()) if len(p) else 0.0, "worst": float(p["pnl"].min()) if len(p) else 0.0}
+
+
 def evaluate(df, split, cost):
     """Returns ({strategy: fit}, buy_hold_test_metrics, buy_hold_daily)."""
     split = pd.Timestamp(split)

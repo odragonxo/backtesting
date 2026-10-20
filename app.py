@@ -15,6 +15,8 @@ from plotly.subplots import make_subplots
 
 import auth
 import backtest as bt
+import custom_signals as csig
+import ml_model as ml
 import settings_store as store
 import universe
 
@@ -28,6 +30,77 @@ WINDOWS = {"3 เดือน": 63, "6 เดือน": 126, "1 ปี": 252, "
 
 def pct(x, d=1):
     return f"{x * 100:.{d}f}%"
+
+
+BUY_C, SELL_C, WIN_C, LOSS_C = "#00C853", "#FF1744", "#00C853", "#FF1744"
+COLORS = {"blue": BLUE, "orange": ORANGE, "green": GREEN, "red": RED, "grey": GREY, "purple": "#ab47bc"}
+
+
+def conv(x):
+    """Money is computed in USD; show it in THB if an exchange rate was entered."""
+    return x * cfg["fx"] if cfg["fx"] > 0 else x
+
+
+def cur(x, signed=False):
+    v = conv(x)
+    sym = "฿" if cfg["fx"] > 0 else "$"
+    sign = ("+" if v >= 0 else "-") if signed else ("-" if v < 0 else "")
+    return f"{sign}{sym}{abs(v):,.0f}"
+
+
+def add_trade_layer(fig, tl, pnl):
+    """Clear BUY (green up-triangle) / SELL (red down-triangle) markers, win/loss connector lines,
+    shaded holding periods and money P/L labels. tl and pnl share the same row order."""
+    if tl.empty:
+        return
+    tl = tl.reset_index(drop=True)
+    pnl = pnl.reset_index(drop=True)
+    win = (tl["return"] > 0).tolist()
+    for flag, colr, nm in ((True, WIN_C, "เทรดกำไร"), (False, LOSS_C, "เทรดขาดทุน")):
+        xs, ys = [], []
+        for w_, ed, ep, xd, xp in zip(win, tl["entry_date"], tl["entry_price"], tl["exit_date"], tl["exit_price"]):
+            if w_ == flag:
+                xs += [ed, xd, None]
+                ys += [ep, xp, None]
+        if xs:
+            fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(color=colr, width=3), name=nm,
+                                     hoverinfo="skip"), row=1, col=1)
+    if len(tl) <= 80:
+        for w_, ed, xd in zip(win, tl["entry_date"], tl["exit_date"]):
+            fig.add_vrect(x0=ed, x1=xd, fillcolor=WIN_C if w_ else LOSS_C, opacity=0.10, line_width=0,
+                          layer="below", row=1, col=1)
+    label = len(tl) <= 40
+    closed = (tl["status"] == "ปิดแล้ว").tolist()
+    hov_in = [f"<b>ซื้อ</b> {d:%Y-%m-%d}<br>ราคา {p:,.2f}<br>ลงทุน {cur(inv)}"
+              for d, p, inv in zip(tl["entry_date"], tl["entry_price"], pnl["invested"])]
+    fig.add_trace(go.Scatter(
+        x=tl["entry_date"], y=tl["entry_price"], mode="markers", name="ซื้อ (BUY)", text=hov_in,
+        hovertemplate="%{text}<extra></extra>",
+        marker=dict(symbol="triangle-up", size=17, color=BUY_C, line=dict(width=2, color="white"))), row=1, col=1)
+    sub = tl[[c_ for c_ in closed]]
+    sp = pnl[[c_ for c_ in closed]]
+    if len(sub):
+        hov_out = [f"<b>ขาย</b> {d:%Y-%m-%d}<br>ราคา {p:,.2f}<br>ผลเทรด {r * 100:+.1f}%<br>กำไร/ขาดทุน {cur(m, True)}"
+                   + (f"<br>เหตุผล: {rs}" if isinstance(rs, str) else "")
+                   for d, p, r, m, rs in zip(sub["exit_date"], sub["exit_price"], sub["return"], sp["pnl"],
+                                             sub["reason"] if "reason" in sub else [None] * len(sub))]
+        fig.add_trace(go.Scatter(
+            x=sub["exit_date"], y=sub["exit_price"], name="ขาย (SELL)", hovertext=hov_out, hoverinfo="text",
+            mode="markers+text" if label else "markers", text=[cur(m, True) for m in sp["pnl"]],
+            textposition="top center",
+            textfont=dict(size=13, color=[WIN_C if m > 0 else LOSS_C for m in sp["pnl"]]),
+            marker=dict(symbol="triangle-down", size=17, color=SELL_C, line=dict(width=2, color="white"))),
+            row=1, col=1)
+    op = [i for i, c_ in enumerate(closed) if not c_]
+    if op:
+        o = tl.iloc[op]
+        po = pnl.iloc[op]
+        fig.add_trace(go.Scatter(
+            x=o["exit_date"], y=o["exit_price"], mode="markers+text", name="ถืออยู่ (ยังไม่ปิด)",
+            text=[f"ถืออยู่ {cur(m, True)}" for m in po["pnl"]], textposition="top center",
+            textfont=dict(size=13, color=[WIN_C if m > 0 else LOSS_C for m in po["pnl"]]),
+            hovertemplate="ราคาล่าสุด %{y:,.2f}<br>กำไร/ขาดทุนที่ยังไม่รับรู้ตามราคาปิดล่าสุด<extra></extra>",
+            marker=dict(symbol="diamond", size=15, color=ORANGE, line=dict(width=2, color="white"))), row=1, col=1)
 
 
 # ---------- cached data / computation ----------
@@ -96,7 +169,8 @@ DEFAULTS = {
     "fee_pct": 0.15, "slip_pct": 0.05, "group": "all", "strat_choice": "auto",
     "account": 10000.0, "risk_pct": 1.0, "atr_mult": 3.0,
     "wf_train_years": 5, "wf_test_months": 12, "fractional": True,
-    "chart_layers": [], "lower_panel": "auto",
+    "chart_layers": [], "lower_panel": "auto", "alloc_pct": 100.0, "compound": True, "fx": 0.0,
+    "custom_sel": ["sma_cross", "rsi"], "custom_params": {}, "custom_mode": "all", "custom_hold": 0,
     "scan_universe": "sp500", "scan_custom": "NVDA, AMD, AVGO, MSFT, AAPL", "scan_group": "all",
     "scan_min_fresh": 1, "scan_uptrend": True, "scan_min_dollar_vol": 20.0, "scan_top_n": 10,
 }
@@ -157,6 +231,11 @@ with st.sidebar:
     cfg["atr_mult"] = st.number_input("Stop = ATR(14) x (ใช้กับกลยุทธ์ที่ไม่มี SL ของตัวเอง)", min_value=0.5,
                                       max_value=10.0, value=float(cfg["atr_mult"]), step=0.5, key="w_atr")
     cfg["fractional"] = st.checkbox("ซื้อหุ้นเศษส่วนได้ (เช่น Dime!)", value=bool(cfg["fractional"]), key="w_frac")
+    cfg["alloc_pct"] = st.number_input("ใช้เงินกี่ % ของพอร์ตต่อเทรด (คำนวณกำไรขาดทุน)", min_value=1.0,
+                                       max_value=100.0, value=float(cfg["alloc_pct"]), step=5.0, key="w_alloc")
+    cfg["compound"] = st.checkbox("ทบต้น (ใช้ยอดคงเหลือเป็นฐานทุกเทรด)", value=bool(cfg["compound"]), key="w_comp")
+    cfg["fx"] = st.number_input("แสดงเงินเป็นบาท: THB ต่อ 1 USD (0 = แสดงเป็นดอลลาร์)", min_value=0.0,
+                                max_value=200.0, value=float(cfg["fx"]), step=0.5, key="w_fx")
 
     with st.expander("💾 บันทึก / สำรองค่าที่ตั้งไว้"):
         st.caption("แอปบันทึกค่าให้อัตโนมัติทุกครั้งที่เปลี่ยน ถ้าโฮสต์บนคลาวด์ที่ไฟล์ถูกรีเซ็ตเมื่อรีสตาร์ต "
@@ -180,6 +259,7 @@ fee, slip = cfg["fee_pct"] / 100, cfg["slip_pct"] / 100
 group, strat_choice = cfg["group"], cfg["strat_choice"]
 account, risk_pct, atr_mult = cfg["account"], cfg["risk_pct"], cfg["atr_mult"]
 fractional = cfg["fractional"]
+alloc, compound = cfg["alloc_pct"] / 100, cfg["compound"]
 persist()
 
 if not ticker:
@@ -213,9 +293,9 @@ with st.expander("ℹ️ กลยุทธ์นี้ทำงานอย่�
     st.write(f"**หลักการ:** {what}")
     st.write(f"**ที่มา/ข้อควรระวัง:** {caveat}")
 
-tab_sig, tab_chart, tab_res, tab_wf, tab_trades, tab_scan = st.tabs(
-    ["🚦 สัญญาณวันนี้", "📊 กราฟราคา", "🧪 ผลทดสอบ", "🧠 ฝึกซ้ำ (Walk-forward)",
-     "🧾 รายการเทรด", "🔍 สแกนหุ้น"])
+tab_sig, tab_chart, tab_res, tab_wf, tab_custom, tab_ai, tab_trades, tab_scan = st.tabs(
+    ["🚦 สัญญาณวันนี้", "📊 กราฟราคา", "🧪 ผลทดสอบ", "🧠 ฝึกซ้ำ (Walk-forward)", "🛠️ ระบบเลือกเอง",
+     "🤖 ผู้ช่วย AI", "🧾 รายการเทรด", "🔍 สแกนหุ้น"])
 
 # =====================================================================
 # Tab 1: today's signal
@@ -225,6 +305,17 @@ with tab_sig:
     banner = {"BUY": st.success, "SELL": st.error, "HOLD": st.info, "WAIT": st.warning}[action]
     banner(f"**{action}** · {msg}")
 
+    try:
+        _am = st.session_state.get("ai_model_uploaded") or ml.load()
+        if _am:
+            _p = float(ml.score(df, _am, "full").iloc[-1])
+            _bt, _ = ml.band(_p, _am["base_rate"])
+            _lv = _am["verdict"]["level"]
+            st.caption(f"🤖 AI: โอกาสสำเร็จตามโมเดล {_p * 100:.0f}% ({_bt}) · ผลวัดโมเดล: "
+                       f"{ {'ok': 'พอใช้', 'weak': 'อ่อนมาก', 'fail': 'ไม่ผ่านเกณฑ์ (อย่าใช้ตัดสิน)', 'none': 'ยังไม่ประเมิน'}[_lv] }"
+                       " · ดูรายละเอียดที่แท็บ 🤖")
+    except Exception:
+        pass
     now_et = pd.Timestamp.now(tz="America/New_York")
     if last_date.date() == now_et.date() and now_et.hour < 16:
         st.warning("แท่งราคาล่าสุดอาจยังไม่ปิด (ตลาดสหรัฐกำลังเปิดอยู่) สัญญาณอาจเปลี่ยนก่อนปิดตลาด "
@@ -347,7 +438,6 @@ with tab_chart:
         fig.add_trace(go.Scatter(x=s.index, y=s.values, name=label, mode="lines",
                                  line=dict(color=color, width=1.5, dash=dash)), row=1, col=1)
 
-    COLORS = {"blue": BLUE, "orange": ORANGE, "green": GREEN, "red": RED, "grey": GREY}
     for label, series, ckey, dash in bt.overlay_lines(name, p, df):
         line(series, label, COLORS[ckey], dash)
 
@@ -388,25 +478,10 @@ with tab_chart:
             fig.add_hline(y=px, line_dash="dash", line_color=col, row=1, col=1,
                           annotation_text=f"{lbl} {px:,.2f}", annotation_position="right")
 
-    # in-position shading + entry/exit markers
+    # buy/sell markers, win/loss lines and money P/L (capital restarts at the first visible trade)
     tv = fit["trades"]
-    tv = tv[tv["exit_date"] >= view.index[0]]
-    if len(tv) <= 80:
-        for _, t in tv.iterrows():
-            fig.add_vrect(x0=t["entry_date"], x1=t["exit_date"], fillcolor=GREEN, opacity=0.08,
-                          line_width=0, layer="below", row=1, col=1)
-    ent = tv[tv["entry_date"] >= view.index[0]]
-    ext = tv[(tv["status"] == "ปิดแล้ว")]
-    fig.add_trace(go.Scatter(
-        x=ent["entry_date"], y=ent["entry_price"], mode="markers", name="เข้าซื้อ",
-        marker=dict(symbol="triangle-up", size=13, color=GREEN, line=dict(width=1, color="white")),
-        hovertemplate="ซื้อ %{x|%Y-%m-%d}<br>%{y:,.2f}<extra></extra>"), row=1, col=1)
-    fig.add_trace(go.Scatter(
-        x=ext["exit_date"], y=ext["exit_price"], mode="markers", name="ขายออก",
-        marker=dict(symbol="triangle-down", size=13, color=RED, line=dict(width=1, color="white")),
-        customdata=ext["return"] * 100,
-        hovertemplate="ขาย %{x|%Y-%m-%d}<br>%{y:,.2f}<br>ผลเทรด %{customdata:+.1f}%<extra></extra>"),
-        row=1, col=1)
+    tv = tv[tv["exit_date"] >= view.index[0]].reset_index(drop=True)
+    add_trade_layer(fig, tv, bt.trade_pnl(tv, account, alloc, compound))
 
     # lower panel: user choice, or automatic by strategy
     panel = cfg["lower_panel"]
@@ -474,8 +549,10 @@ with tab_chart:
     fig.update_layout(height=680, xaxis_rangeslider_visible=False, hovermode="x unified",
                       legend=dict(orientation="h", y=1.04), margin=dict(l=10, r=10, t=30, b=10))
     st.plotly_chart(fig)
-    st.caption("สามเหลี่ยมเขียว = จุดเข้า (ราคาเปิดวันถัดจากสัญญาณ) · สามเหลี่ยมแดง = จุดออก · "
-               "แถบเขียวจาง = ช่วงที่ถือหุ้น · เส้นประ Entry/SL/TP = ระดับของเทรดที่ถืออยู่หรือที่กำลังจะเข้า")
+    st.caption("▲ เขียว = ซื้อ (ราคาเปิดวันถัดจากสัญญาณ) · ▼ แดง = ขาย · เส้นหนาเขียว/แดง = เทรดกำไร/ขาดทุน · "
+               "ตัวเลขข้างลูกศรขาย = กำไร/ขาดทุนเป็นเงิน คำนวณจากเงินลงทุน "
+               f"{cur(account)} ({alloc * 100:.0f}% ต่อเทรด, {'ทบต้น' if compound else 'ไม่ทบต้น'}) "
+               "เริ่มนับที่เทรดแรกในช่วงที่แสดง · เส้นประ Entry/SL/TP = ระดับของเทรดที่ถืออยู่หรือกำลังจะเข้า")
     if "swing" in layers or "fib" in layers:
         st.caption("⚠️ Major Swing รู้ผลช้า: จุดสูง/ต่ำถูกยืนยันหลังจาก Stochastic ไปถึงโซนตรงข้ามแล้ว (ดูวันที่ใน hover) "
                    "กราฟย้อนหลังจึงดูแม่นกว่าที่เห็นตอนเทรดจริง และเส้น Fib จะถูกวาดใหม่เมื่อมีสวิงใหม่")
@@ -514,6 +591,16 @@ with tab_res:
     if m_te.get("trades", 0) < 20:
         notes.append("⚠️ เทรดน้อยกว่า 20 ครั้ง สถิติยังไม่น่าเชื่อถือ")
     st.write(f"**{LABEL[name]}**: " + " · ".join(notes))
+
+    cs0 = bt.capital_summary(fit["trades"], close, pd.Timestamp(split), account, alloc, compound)
+    st.markdown(f"**💰 ถ้าลงทุน {cur(account)} ตามกลยุทธ์นี้ตั้งแต่ {split}** "
+                f"(ใช้ {alloc * 100:.0f}% ของพอร์ตต่อเทรด, {'ทบต้น' if compound else 'ไม่ทบต้น'}, หักค่าธรรมเนียมแล้ว)")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("เงินคงเหลือ", cur(cs0["final"]), cur(cs0["pnl"], True))
+    k2.metric("ถ้าซื้อถือเฉย ๆ", cur(cs0["bh_final"]), cur(cs0["bh_pnl"], True), delta_color="off")
+    k3.metric("เทรดที่ชนะ", f"{cs0['wins']}/{cs0['n']}")
+    k4.metric("ดีสุด / แย่สุด", f"{cur(cs0['best'], True)} / {cur(cs0['worst'], True)}")
+    st.caption("ผลย้อนหลังไม่ใช่การรับประกัน · เงินส่วนที่ไม่ได้อยู่ในตลาดนับเป็นเงินสดที่ไม่มีดอกเบี้ย")
     st.info("💡 ยิ่งลองกลยุทธ์และพารามิเตอร์มาก ก็ยิ่งมีโอกาสเจอตัวที่ \"บังเอิญดี\" ในช่วงทดสอบ "
             "ควรเชื่อกลยุทธ์ที่ดีทั้ง Train และ Test ใกล้เคียงกัน, ใช้ได้กับหุ้นหลายตัว (ลองแท็บสแกน) "
             "และมีเหตุผลรองรับ มากกว่าเลือกตัวที่ตัวเลข Test สูงสุดตัวเดียว "
@@ -647,6 +734,293 @@ with tab_wf:
                 "แต่ยังเป็นการเรียนรู้จากอดีต ไม่ใช่การทำนายอนาคต")
 
 # =====================================================================
+# Tab: custom system (user-picked indicators)
+# =====================================================================
+def price_traces(fig, view):
+    if {"Open", "High", "Low"} <= set(view.columns):
+        fig.add_trace(go.Candlestick(x=view.index, open=view["Open"], high=view["High"], low=view["Low"],
+                                     close=view["Close"], name="ราคา", increasing_line_color=GREEN,
+                                     decreasing_line_color=RED), row=1, col=1)
+    else:
+        fig.add_trace(go.Scatter(x=view.index, y=view["Close"], name="ราคาปิด", line=dict(color=BLUE)), row=1, col=1)
+
+
+def custom_figure(df_, fit_, sels_, win_):
+    view_ = df_.iloc[-win_:] if win_ else df_
+    panel_ = None
+    for s_ in sels_:
+        panel_ = csig.panel_data(df_, s_["key"], s_["params"])
+        if panel_:
+            break
+    two = panel_ is not None
+    f_ = make_subplots(rows=2 if two else 1, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                       row_heights=[0.72, 0.28] if two else [1.0])
+    price_traces(f_, view_)
+    seen = set()
+    for s_ in sels_:
+        for lab, ser, ck, dash in csig.overlays(df_, s_["key"], s_["params"]):
+            if lab in seen:
+                continue
+            seen.add(lab)
+            ser = ser.reindex(view_.index)
+            f_.add_trace(go.Scatter(x=ser.index, y=ser.values, name=lab, mode="lines",
+                                    line=dict(color=COLORS[ck], width=1.6, dash=dash)), row=1, col=1)
+    t_ = fit_["trades"]
+    t_ = t_[t_["exit_date"] >= view_.index[0]].reset_index(drop=True)
+    add_trade_layer(f_, t_, bt.trade_pnl(t_, account, alloc, compound))
+    if two:
+        if panel_["hist"] is not None:
+            hs = panel_["hist"].reindex(view_.index)
+            f_.add_trace(go.Bar(x=hs.index, y=hs.values, name="Histogram",
+                                marker_color=[GREEN if v >= 0 else RED for v in hs.fillna(0)]), row=2, col=1)
+        for lab, ser, ck in panel_["lines"]:
+            ser = ser.reindex(view_.index)
+            f_.add_trace(go.Scatter(x=ser.index, y=ser.values, name=lab, line=dict(color=COLORS[ck], width=1.3)),
+                         row=2, col=1)
+        for y_, ck in panel_["hlines"]:
+            f_.add_hline(y=y_, line_dash="dot", line_color=COLORS[ck], row=2, col=1)
+        if panel_["yrange"]:
+            f_.update_yaxes(range=list(panel_["yrange"]), row=2, col=1)
+    f_.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    f_.update_layout(height=640, xaxis_rangeslider_visible=False, hovermode="x unified",
+                     legend=dict(orientation="h", y=1.05), margin=dict(l=10, r=10, t=30, b=10))
+    return f_
+
+
+with tab_custom:
+    st.markdown("**🛠️ ระบบเลือกเอง** เลือกอินดิเคเตอร์ที่อยากใช้ ปรับค่า แล้วดูจุดซื้อขายบนกราฟพร้อมกำไรขาดทุนตามเงินลงทุนที่ตั้งไว้ "
+                "เป็นระบบเสริม แยกจากกลยุทธ์สำเร็จรูปด้านบน ใช้หุ้น วันที่ และค่าธรรมเนียมชุดเดียวกับที่ตั้งทางซ้าย")
+    keys = list(csig.SPEC)
+    sel_keys = st.multiselect("เลือกอินดิเคเตอร์ (เลือกได้หลายตัว)", keys,
+                              default=[k for k in cfg["custom_sel"] if k in keys],
+                              format_func=lambda k: csig.SPEC[k]["label"], key="w_cs_sel")
+    cfg["custom_sel"] = sel_keys
+    sels = []
+    for k in sel_keys:
+        saved = cfg["custom_params"].get(k, {})
+        with st.expander(f"{csig.SPEC[k]['label']} — {csig.SPEC[k]['desc']}"):
+            plist = csig.SPEC[k]["params"]
+            vals = {}
+            for col, (pk, lab, mn, mx, dflt, stp) in zip(st.columns(len(plist)), plist):
+                v0 = saved.get(pk, dflt)
+                if isinstance(dflt, float):
+                    vals[pk] = float(col.number_input(lab, min_value=float(mn), max_value=float(mx),
+                                                      value=float(v0), step=float(stp), key=f"w_cs_{k}_{pk}"))
+                else:
+                    vals[pk] = int(col.number_input(lab, min_value=int(mn), max_value=int(mx),
+                                                    value=int(v0), step=int(stp), key=f"w_cs_{k}_{pk}"))
+            cfg["custom_params"][k] = vals
+        sels.append({"key": k, "params": vals})
+    m_opts = list(csig.MODES)
+    if len(sels) > 1:
+        cfg["custom_mode"] = st.radio("รวมสัญญาณหลายตัวอย่างไร", m_opts, key="w_cs_mode",
+                                      index=m_opts.index(cfg["custom_mode"]) if cfg["custom_mode"] in m_opts else 0,
+                                      format_func=lambda x: csig.MODES[x])
+    cfg["custom_hold"] = int(st.number_input("ถือไม่เกินกี่วันทำการ (0 = ไม่จำกัด)", min_value=0, max_value=250,
+                                             value=int(cfg["custom_hold"]), key="w_cs_hold"))
+    persist()
+
+    errs = csig.validate(sels, df) if sels else []
+    if not sels:
+        st.info("เลือกอย่างน้อย 1 อินดิเคเตอร์ด้านบน")
+    elif errs:
+        for e_ in errs:
+            st.warning(e_)
+    else:
+        mode_ = cfg["custom_mode"] if len(sels) > 1 else "all"
+        sig_c = csig.build_signal(df, sels, mode_, cfg["custom_hold"])
+        cf = bt.fit_from_signal(df, sig_c, split, cost, "custom")
+        st.caption("กฎ: " + csig.describe(sels, mode_, cfg["custom_hold"]) + " · สัญญาณตอนปิดตลาด ซื้อขายที่ราคาเปิดวันถัดไป")
+        act_c, msg_c = bt.current_action(sig_c)
+        {"BUY": st.success, "SELL": st.error, "HOLD": st.info, "WAIT": st.warning}[act_c](f"**{act_c}** · {msg_c}")
+
+        cs1 = bt.capital_summary(cf["trades"], close, pd.Timestamp(split), account, alloc, compound)
+        st.markdown(f"**💰 ถ้าลงทุน {cur(account)} ตามระบบนี้ตั้งแต่ {split}**")
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("เงินคงเหลือ", cur(cs1["final"]), cur(cs1["pnl"], True))
+        q2.metric("ถ้าซื้อถือเฉย ๆ", cur(cs1["bh_final"]), cur(cs1["bh_pnl"], True), delta_color="off")
+        q3.metric("เทรดที่ชนะ", f"{cs1['wins']}/{cs1['n']}")
+        q4.metric("ดีสุด / แย่สุด", f"{cur(cs1['best'], True)} / {cur(cs1['worst'], True)}")
+
+        cw = st.radio("ช่วงที่แสดงบนกราฟ", list(WINDOWS), index=2, horizontal=True, key="w_cs_win")
+        st.plotly_chart(custom_figure(df, cf, sels, WINDOWS[cw]))
+        st.caption("▲ เขียว = ซื้อ · ▼ แดง = ขาย (ตัวเลขข้างลูกศร = กำไร/ขาดทุนเป็นเงิน) · เส้นหนาเขียว/แดง = เทรดกำไร/ขาดทุน · ◆ ส้ม = ยังถืออยู่")
+
+        mt, mb = cf["test"], m_bh
+        cmp_c = pd.DataFrame({
+            "ระบบเลือกเอง (Test)": [pct(mt["total_return"]), pct(mt["cagr"]), pct(mt["max_drawdown"]),
+                                    round(mt["sharpe"], 2), mt["trades"], pct(mt["win_rate"], 0),
+                                    f"{mt['avg_days']:.1f}"],
+            "ซื้อถือ (Test)": [pct(mb["total_return"]), pct(mb["cagr"]), pct(mb["max_drawdown"]),
+                               round(mb["sharpe"], 2), "-", "-", "-"]},
+            index=["ผลตอบแทนรวม", "CAGR", "Max drawdown", "Sharpe", "จำนวนเทรด", "Win rate", "ถือเฉลี่ย (วัน)"])
+        st.dataframe(cmp_c)
+        if cf["train"].get("sharpe", 0) > 0 and mt["sharpe"] < 0.5 * cf["train"]["sharpe"]:
+            st.warning("Sharpe ช่วง Test ตกจาก Train เกินครึ่ง อาจเป็นเพราะค่าที่ตั้งเข้ากับอดีตมากเกินไป")
+        if mt.get("trades", 0) < 20:
+            st.warning("เทรดน้อยกว่า 20 ครั้งในช่วง Test สถิติยังไม่น่าเชื่อถือ")
+        st.info("💡 การลองปรับค่าหลายรอบแล้วเลือกชุดที่ดูดีที่สุด คือการ overfit ด้วยมือ ดูผลช่วง Test เป็นหลัก "
+                "ลองกับหุ้นตัวอื่น และดูตาราง walk-forward/ทนต่อต้นทุนของกลยุทธ์สำเร็จรูปเทียบ")
+        only_t = st.checkbox("ตารางเทรด: เฉพาะช่วงทดสอบ", value=True, key="w_cs_onlytest")
+        tc = cf["trades"][cf["trades"]["entry_date"] >= pd.Timestamp(split)] if only_t else cf["trades"]
+        if len(tc):
+            tcp = bt.trade_pnl(tc, account, alloc, compound)
+            o2 = tcp.copy()
+            o2["return"] = (o2["return"] * 100).round(2)
+            for k_ in ("invested", "pnl", "balance"):
+                o2[k_] = o2[k_].map(conv).round(0)
+            o2["entry_date"], o2["exit_date"] = o2["entry_date"].dt.date, o2["exit_date"].dt.date
+            st.dataframe(o2.rename(columns={
+                "entry_date": "วันเข้า", "entry_price": "ราคาเข้า", "exit_date": "วันออก", "exit_price": "ราคาออก",
+                "return": "ผลตอบแทน (%)", "status": "สถานะ", "days": "วันที่ถือ", "invested": "เงินที่ลงทุน",
+                "pnl": "กำไร/ขาดทุน", "balance": "ยอดคงเหลือ"}), hide_index=True)
+
+# =====================================================================
+# Tab: AI assistant (statistical model trained offline, loaded from file)
+# =====================================================================
+with tab_ai:
+    st.markdown("**🤖 ผู้ช่วย AI** เป็น **โมเดลสถิติ** (logistic regression) ที่เรียนรู้จากราคาย้อนหลังของหุ้นหลายตัว "
+                "แล้วให้ \"คะแนน\" ว่าหลังซื้อที่ราคาเปิดวันถัดไป ราคาจะสูงกว่าจุดเข้าในอีกไม่กี่วันมีโอกาสเท่าไร "
+                "ไม่ใช่ ChatGPT และไม่ใช่ตัวทำนายอนาคต แอปจะเชื่อโมเดลเท่าที่ผลทดสอบนอกตัวอย่างอนุญาตเท่านั้น")
+    model = st.session_state.get("ai_model_uploaded") or ml.load()
+
+    with st.expander("⚙️ ฝึกโมเดลใหม่ / โหลดไฟล์โมเดลที่เคยฝึกไว้", expanded=model is None):
+        t1, t2, t3 = st.columns(3)
+        n_train = int(t1.number_input("จำนวนหุ้นที่ใช้ฝึก", min_value=20, max_value=150, value=50, step=10, key="w_ai_n"))
+        horizon = int(t2.selectbox("ทำนายกี่วันข้างหน้า", [5, 10, 20], index=1, key="w_ai_h"))
+        y0 = int(t3.number_input("เริ่มข้อมูลปี", min_value=2000, max_value=2018, value=2010, key="w_ai_y0"))
+        if st.button("ฝึกโมเดล (ใช้เวลาราว 2-5 นาที)", type="primary"):
+            uni_, _ = get_universe()
+            pool = sorted(uni_["ticker"].tolist())
+            pick_t = sorted(np.random.default_rng(42).choice(pool, size=min(n_train, len(pool)), replace=False).tolist())
+            prog = st.progress(0.0, text="เริ่ม...")
+            try:
+                frames = ml.download_history(pick_t, f"{y0}-01-01",
+                                             progress=lambda f, m: prog.progress(f * 0.5, text=m))
+                if len(frames) < 15:
+                    raise ValueError(f"ดึงราคาสำเร็จแค่ {len(frames)} ตัว (ต้องอย่างน้อย 15) ลองใหม่ภายหลัง")
+                mdl = ml.train_pipeline(frames, horizon=horizon,
+                                        progress=lambda f, m: prog.progress(0.5 + f * 0.5, text=m))
+                ml.save(mdl)
+                st.session_state.pop("ai_model_uploaded", None)
+                prog.empty()
+                st.rerun()
+            except Exception as e:
+                prog.empty()
+                st.error(f"ฝึกโมเดลไม่สำเร็จ: {e}")
+        up_m = st.file_uploader("โหลดไฟล์โมเดลที่เคยฝึกไว้ (.json)", type="json", key="w_ai_up")
+        if up_m is not None and st.button("ใช้ไฟล์นี้"):
+            try:
+                st.session_state["ai_model_uploaded"] = ml.validate_model(json.loads(up_m.getvalue().decode("utf-8")))
+                st.rerun()
+            except Exception as e:
+                st.error(f"ใช้ไฟล์นี้ไม่ได้: {e}")
+        if model is not None:
+            st.download_button("ดาวน์โหลดไฟล์โมเดล (JSON)", json.dumps(model, ensure_ascii=False).encode("utf-8"),
+                               file_name="ai_model.json", mime="application/json")
+        st.caption("บนคลาวด์ ไฟล์ที่ฝึกในแอปอาจหายเมื่อรีสตาร์ต ให้ดาวน์โหลดแล้วอัปโหลดไว้ใน repo ที่ `models/ai_model.json` "
+                   "(แอปจะโหลดให้อัตโนมัติ) หุ้นที่ใช้ฝึกสุ่มจากรายชื่อ S&P 500 ปัจจุบัน จึงมี survivorship bias")
+
+    if model is None:
+        st.info("ยังไม่มีโมเดล กดฝึกโมเดลด้านบน หรือโหลดไฟล์ที่เคยฝึกไว้")
+    else:
+        lvl, vtxt = model["verdict"]["level"], model["verdict"]["text"]
+        {"ok": st.success, "weak": st.warning, "fail": st.error, "none": st.info}[lvl](f"**ผลวัดโมเดล:** {vtxt}")
+        st.caption(f"ฝึกเมื่อ {model['trained_at']} · หุ้น {len(model['universe'])} ตัว · ข้อมูล "
+                   f"{model['data_range'][0]} → {model['data_range'][1]} · ทำนาย {model['horizon']} วัน "
+                   f"(ถือว่า \"สำเร็จ\" = สูงกว่าจุดเข้า {model['hurdle'] * 100:.1f}%) · อัตราสำเร็จเฉลี่ย {model['base_rate'] * 100:.1f}%")
+        with st.expander("ดูผลวัดจริงของโมเดล (ข้อมูลที่โมเดลไม่เคยเห็นตอนฝึก)"):
+            wf_ = model["metrics"]["walk_forward"]
+            if wf_.get("by_year"):
+                by = pd.DataFrame(wf_["by_year"])
+                st.markdown(f"**Walk-forward รายปี** (AUC รวม {wf_['auc']:.3f}; 0.5 = เดา)")
+                st.dataframe(pd.DataFrame({
+                    "ปี": by["year"], "AUC": by["auc"].round(3), "ผลเฉลี่ยกลุ่มคะแนนสูงสุด": [pct(v, 2) for v in by["top_mean"]],
+                    "ผลเฉลี่ยทั้งหมด": [pct(v, 2) for v in by["all_mean"]],
+                    "ผลเฉลี่ยกลุ่มคะแนนต่ำสุด": [pct(v, 2) for v in by["bottom_mean"]]}), hide_index=True)
+            ho_ = model["metrics"]["holdout"]
+            if ho_.get("quintiles"):
+                st.markdown(f"**Holdout หลัง {model['cutoff']}** (AUC {ho_['auc']:.3f}, {ho_['n']:,} ตัวอย่าง) "
+                            "แบ่งตามคะแนน 5 กลุ่ม (กลุ่ม 5 = คะแนนสูงสุด)")
+                st.dataframe(pd.DataFrame({
+                    "กลุ่มคะแนน": [q["q"] for q in ho_["quintiles"]],
+                    f"ผลเฉลี่ยหลัง {model['horizon']} วัน": [pct(q["mean_fwd"], 2) for q in ho_["quintiles"]],
+                    "อัตราสำเร็จ": [pct(q["hit"], 0) for q in ho_["quintiles"]],
+                    "จำนวน": [q["n"] for q in ho_["quintiles"]]}), hide_index=True)
+                st.caption("ถ้าโมเดลมีประโยชน์ กลุ่ม 5 ควรให้ผลและอัตราสำเร็จสูงกว่ากลุ่ม 1 อย่างต่อเนื่องหลายปี")
+
+        st.subheader(f"คะแนน AI ของ {ticker} วันนี้")
+        try:
+            sc_full = ml.score(df, model, "full")
+            p_now = float(sc_full.iloc[-1])
+        except Exception as e:
+            sc_full, p_now = None, float("nan")
+            st.warning(f"คำนวณคะแนนไม่ได้: {e}")
+        if p_now == p_now:
+            b_txt, b_sgn = ml.band(p_now, model["base_rate"])
+            hist_ = sc_full.dropna()
+            pctile = float((hist_ <= p_now).mean())
+            a1, a2, a3 = st.columns(3)
+            a1.metric("โอกาสสำเร็จตามโมเดล", f"{p_now * 100:.0f}%",
+                      f"{(p_now - model['base_rate']) * 100:+.1f} จุดจากค่าเฉลี่ย", delta_color="off")
+            a2.metric("ระดับ", b_txt)
+            a3.metric("เทียบประวัติของหุ้นนี้", f"สูงกว่า {pctile * 100:.0f}% ของวัน")
+            act_t, _ = bt.current_action_for(fit)
+            if lvl == "fail":
+                st.error("โมเดลไม่ผ่านเกณฑ์ คะแนนนี้ไม่ควรใช้ประกอบการตัดสินใจ ใช้เทคนิคและการบริหารความเสี่ยงของคุณเองเป็นหลัก")
+            else:
+                if act_t == "BUY" and b_sgn > 0:
+                    rel = "✅ สอดคล้อง: เทคนิคให้ซื้อและ AI ให้คะแนนสูง"
+                elif act_t == "BUY" and b_sgn < 0:
+                    rel = "⚠️ ขัดแย้ง: เทคนิคให้ซื้อแต่ AI ให้คะแนนต่ำ ลองรอหรือลดขนาดไม้"
+                elif act_t in ("SELL",) and b_sgn > 0:
+                    rel = "⚠️ ขัดแย้ง: เทคนิคให้ขายแต่ AI ให้คะแนนสูง"
+                elif act_t == "SELL" and b_sgn < 0:
+                    rel = "✅ สอดคล้อง: เทคนิคให้ขายและ AI ให้คะแนนต่ำ"
+                else:
+                    rel = f"เทคนิคตอนนี้ = {act_t}, AI = {b_txt} ไม่มีข้อขัดแย้งชัดเจน"
+                st.write(f"**รวมกับสัญญาณเทคนิค ({LABEL[name]}):** {rel}")
+                if lvl == "weak":
+                    st.caption("โมเดลนี้มีสัญญาณอ่อนมาก ใช้เป็นข้อมูลประกอบเท่านั้น")
+            ct = ml.contributions(df, model, "full")
+            if ct is not None:
+                top = ct.head(8).iloc[::-1]
+                figc = go.Figure(go.Bar(x=top["contrib"], y=top["label"], orientation="h",
+                                        marker_color=[WIN_C if v > 0 else LOSS_C for v in top["contrib"]]))
+                figc.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10),
+                                   title="อะไรดันคะแนนขึ้น (เขียว) หรือลง (แดง)")
+                st.plotly_chart(figc)
+
+        st.subheader("ถ้าใช้ AI เป็นตัวกรองสัญญาณของกลยุทธ์ที่เลือก")
+        st.caption(f"ทดสอบเฉพาะเทรดหลัง {model['cutoff']} ด้วยโมเดล cutoff ที่ไม่เคยเห็นช่วงนี้ตอนฝึก "
+                   "(ไม่ใช้โมเดลเต็ม เพราะเคยเห็นข้อมูลช่วงนี้แล้วจะโกงตัวเอง) ตัวอย่างมักน้อยมาก อย่าด่วนสรุป")
+        try:
+            sc_cut = ml.score(df, model, "cut")
+            t_ = fit["trades"][fit["trades"]["entry_date"] > pd.Timestamp(model["cutoff"])].copy()
+            if t_.empty:
+                st.info("กลยุทธ์นี้ไม่มีเทรดหลังวัน cutoff")
+            else:
+                pos_i = np.maximum(df.index.get_indexer(t_["entry_date"]) - 1, 0)  # score at the signal bar
+                t_["ai"] = sc_cut.iloc[pos_i].values
+                t_ = t_.dropna(subset=["ai"])
+                thr = st.slider("เข้าเทรดเฉพาะเมื่อคะแนน AI ≥", 0.30, 0.70, float(round(model["base_rate"], 2)), 0.01,
+                                key="w_ai_thr")
+                rows_f = []
+                for lab, sub in (("ทุกเทรด (ไม่กรอง)", t_), ("ผ่านตัวกรอง AI", t_[t_["ai"] >= thr]),
+                                 ("ถูก AI กรองออก", t_[t_["ai"] < thr])):
+                    if len(sub):
+                        bal = bt.trade_pnl(sub, account, alloc, compound)["balance"].iloc[-1] - account
+                        rows_f.append({"กลุ่ม": lab, "เทรด": len(sub), "ชนะ": pct((sub["return"] > 0).mean(), 0),
+                                       "ผลเฉลี่ย/เทรด": pct(sub["return"].mean(), 2), "กำไร/ขาดทุนรวม": cur(bal, True)})
+                    else:
+                        rows_f.append({"กลุ่ม": lab, "เทรด": 0, "ชนะ": "-", "ผลเฉลี่ย/เทรด": "-", "กำไร/ขาดทุนรวม": "-"})
+                st.dataframe(pd.DataFrame(rows_f), hide_index=True)
+                if len(t_) < 30:
+                    st.warning(f"มีเทรดแค่ {len(t_)} ครั้ง น้อยเกินกว่าจะสรุปว่า AI ช่วยได้หรือไม่")
+        except Exception as e:
+            st.warning(f"ทดสอบตัวกรองไม่ได้: {e}")
+
+# =====================================================================
 # Tab 4: trade log
 # =====================================================================
 with tab_trades:
@@ -657,20 +1031,27 @@ with tab_trades:
     if tl.empty:
         st.info("ไม่มีเทรดในช่วงนี้")
     else:
+        tlp = bt.trade_pnl(tl, account, alloc, compound)
         fig3 = go.Figure(go.Bar(
-            x=list(range(1, len(tl) + 1)), y=tl["return"] * 100,
-            marker_color=[GREEN if v > 0 else RED for v in tl["return"]],
-            customdata=tl["entry_date"].dt.strftime("%Y-%m-%d"),
-            hovertemplate="เทรด #%{x} (เข้า %{customdata})<br>%{y:+.1f}%<extra></extra>"))
-        fig3.update_layout(height=300, xaxis_title="ลำดับเทรด", yaxis_title="ผลตอบแทน (%)",
+            x=list(range(1, len(tlp) + 1)), y=[conv(v) for v in tlp["pnl"]],
+            marker_color=[WIN_C if v > 0 else LOSS_C for v in tlp["pnl"]],
+            customdata=tlp["entry_date"].dt.strftime("%Y-%m-%d"),
+            hovertemplate="เทรด #%{x} (เข้า %{customdata})<br>%{y:+,.0f}<extra></extra>"))
+        fig3.update_layout(height=300, xaxis_title="ลำดับเทรด",
+                           yaxis_title=f"กำไร/ขาดทุน ({'฿' if cfg['fx'] > 0 else '$'})",
                            margin=dict(l=10, r=10, t=20, b=10))
         st.plotly_chart(fig3)
-        out = tl.copy()
+        st.caption(f"คำนวณจากเงินลงทุน {cur(account)} · ใช้ {alloc * 100:.0f}% ของพอร์ตต่อเทรด · "
+                   f"{'ทบต้น' if compound else 'ไม่ทบต้น'} · เริ่มนับที่เทรดแรกในตาราง")
+        out = tlp.copy()
         out["return"] = (out["return"] * 100).round(2)
+        for k_ in ("invested", "pnl", "balance"):
+            out[k_] = out[k_].map(conv).round(0)
         out["entry_date"], out["exit_date"] = out["entry_date"].dt.date, out["exit_date"].dt.date
         out = out.rename(columns={"entry_date": "วันเข้า", "entry_price": "ราคาเข้า", "exit_date": "วันออก",
                                   "exit_price": "ราคาออก", "return": "ผลตอบแทน (%)", "status": "สถานะ",
-                                  "days": "วันที่ถือ", "reason": "เหตุผลออก"})
+                                  "days": "วันที่ถือ", "reason": "เหตุผลออก", "invested": "เงินที่ลงทุน",
+                                  "pnl": "กำไร/ขาดทุน", "balance": "ยอดคงเหลือ"})
         st.dataframe(out, hide_index=True)
         st.download_button("ดาวน์โหลด CSV", out.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{ticker}_{name}_trades.csv", mime="text/csv")
