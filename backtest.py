@@ -747,6 +747,37 @@ def fit_strategy(df, split, name, cost):
             "trades": trades, "train": m_tr, "test": m_te, "state": state}
 
 
+def params_valid(p):
+    """Human-readable problems with a hand-edited parameter set (empty list = fine)."""
+    errs = []
+    if "fast" in p and "slow" in p and p["fast"] >= p["slow"]:
+        errs.append("ค่าเร็วต้องน้อยกว่าค่าช้า")
+    if "exit_n" in p and "n" in p and p["exit_n"] >= p["n"]:
+        errs.append("ช่วงออก (exit_n) ต้องสั้นกว่าช่วงเข้า (n)")
+    if "low" in p and "exit_level" in p and p["low"] >= p["exit_level"]:
+        errs.append("ระดับซื้อ (low) ต้องต่ำกว่าระดับขาย (exit_level)")
+    for k in ("n", "exit_n", "fast", "slow", "sig", "trend_n", "max_hold", "mult", "factor", "k"):
+        if k in p and p[k] <= 0:
+            errs.append(f"{k} ต้องมากกว่า 0")
+    return errs
+
+
+def fit_fixed(df, split, name, params, cost):
+    """Like fit_strategy but with parameters chosen by the user (no search). Works for engine strategies too."""
+    split = pd.Timestamp(split)
+    daily, pos, trades, signal, state = simulate(df, name, params, cost)
+    tr_mask, te_mask = daily.index < split, daily.index >= split
+    return {"name": name, "params": params, "signal": signal, "daily": daily, "pos": pos, "trades": trades,
+            "train": metrics(daily[tr_mask], pos[tr_mask], trades[trades["entry_date"] < split]),
+            "test": metrics(daily[te_mask], pos[te_mask], trades[trades["entry_date"] >= split]), "state": state}
+
+
+def bh_test_metrics(df, split):
+    bh = df["Close"].pct_change().fillna(0)
+    bh = bh[bh.index >= pd.Timestamp(split)]
+    return metrics(bh, pd.Series(1.0, index=bh.index), None)
+
+
 def fit_from_signal(df, signal, split, cost, name="custom", params=None):
     """Same result shape as fit_strategy, but for a ready-made 0/1 signal (no parameter search)."""
     split = pd.Timestamp(split)
@@ -801,7 +832,11 @@ def cost_stress(df, fit, split, cost, mults=(1, 2, 3)):
     split = pd.Timestamp(split)
     rows = []
     for k in mults:
-        d, pos, tl, _, _ = simulate(df, fit["name"], fit["params"], cost * k)
+        if fit["name"] in STRATEGIES:
+            d, pos, tl, _, _ = simulate(df, fit["name"], fit["params"], cost * k)
+        else:  # user-built signal (custom system)
+            d, pos = run(df, fit["signal"], cost * k)
+            tl = trade_log(df, fit["signal"], cost * k)
         te = d.index >= split
         m = metrics(d[te], pos[te], tl[tl["entry_date"] >= split])
         rows.append({"mult": k, "cost_pct": cost * k * 100, "cagr": m["cagr"], "sharpe": m["sharpe"],
@@ -1059,22 +1094,26 @@ SCAN_SPECS = {
     "ibs": {"low": 0.2, "max_hold": 5, "trend": 200},
     "boll_pull": {"k": 2.0, "max_hold": 10},
     "short_breakout": {"n": 10, "exit_n": 5, "max_hold": 10},
-    "gtr_default": {},
+    "gtr": {"factor": 2.0, "early": 1, "scale": 1.0, "retrace": 0.0},
 }
 
 
-def scan_ticker(df, names):
-    """Today's state of each chosen strategy (fixed params) plus a few ranking stats."""
+def scan_ticker(df, names, specs=None, extra=None):
+    """Today's state of each chosen strategy plus a few ranking stats.
+    specs: {name: params} overriding SCAN_SPECS; extra: {name: callable(df) -> 0/1 signal} for user-built signals."""
     if len(df) < 260:
         return None
     c = df["Close"]
     has_hl = {"High", "Low"} <= set(df.columns)
     fresh, held = [], []
     for nm in names:
-        if nm in NEEDS_HL and not has_hl:
-            continue
         try:
-            sg = STRATEGIES[nm][0](df, **SCAN_SPECS[nm])
+            if extra and nm in extra:
+                sg = extra[nm](df)
+            else:
+                if nm in NEEDS_HL and not has_hl:
+                    continue
+                sg = STRATEGIES[nm][0](df, **((specs or {}).get(nm, SCAN_SPECS[nm])))
         except Exception:
             continue
         if int(sg.iloc[-1]) == 1:

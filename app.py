@@ -48,6 +48,38 @@ def cur(x, signed=False):
     return f"{sign}{sym}{abs(v):,.0f}"
 
 
+PARAM_TH = {"n": "ช่วง n (วัน)", "exit_n": "ช่วงออก (วัน)", "fast": "เร็ว (วัน)", "slow": "ช้า (วัน)",
+            "sig": "สัญญาณ (วัน)", "mult": "ตัวคูณ ATR", "low": "ระดับซื้อ/ล่าง", "exit_level": "ระดับขาย/ออก",
+            "trend_n": "ฟิลเตอร์เทรนด์ SMA (วัน)", "trend": "ฟิลเตอร์เทรนด์ SMA (0=ปิด)", "max_hold": "ถือสูงสุด (วัน)",
+            "k": "ส่วนเบี่ยงเบน (เท่า)", "factor": "ตัวคูณ Supertrend", "early": "Early Entry (1=เปิด 0=ปิด)",
+            "scale": "สเกล SL/TP", "retrace": "รอราคาย้อน (x ATR, 0=ซื้อเลย)"}
+
+
+def param_inputs(base, saved, key_prefix):
+    """One number input per parameter. Type (int/float) and bounds come from the default in `base`;
+    `saved` holds the user's previous values."""
+    keys = list(base)
+    vals = {}
+    for i in range(0, len(keys), 4):
+        part = keys[i:i + 4]
+        for col, k in zip(st.columns(len(part)), part):
+            d0, v0 = base[k], saved.get(k, base[k])
+            lab = PARAM_TH.get(k, k)
+            if isinstance(d0, float):
+                hi = max(5.0, float(d0) * 5)
+                vals[k] = float(col.number_input(lab, min_value=0.0, max_value=hi, value=float(min(max(v0, 0.0), hi)),
+                                                 step=0.05 if d0 < 1 else 0.1, key=f"{key_prefix}_{k}"))
+            else:
+                hi = max(60, int(d0) * 5, 1300 if k == "n" else 0)
+                vals[k] = int(col.number_input(lab, min_value=0, max_value=hi, value=int(min(max(v0, 0), hi)),
+                                               step=1, key=f"{key_prefix}_{k}"))
+    return vals
+
+
+def scan_label(n):
+    return {"custom": "ระบบเลือกเอง", "gtr": "GTR"}.get(n, LABEL.get(n, n))
+
+
 def add_trade_layer(fig, tl, pnl):
     """Clear BUY (green up-triangle) / SELL (red down-triangle) markers, win/loss connector lines,
     shaded holding periods and money P/L labels. tl and pnl share the same row order."""
@@ -170,6 +202,7 @@ DEFAULTS = {
     "account": 10000.0, "risk_pct": 1.0, "atr_mult": 3.0,
     "wf_train_years": 5, "wf_test_months": 12, "fractional": True,
     "chart_layers": [], "lower_panel": "auto", "alloc_pct": 100.0, "compound": True, "fx": 0.0,
+    "res_pick": "", "res_manual": False, "res_params": {}, "scan_signals": [], "scan_params": {},
     "custom_sel": ["sma_cross", "rsi"], "custom_params": {}, "custom_mode": "all", "custom_hold": 0,
     "scan_universe": "sp500", "scan_custom": "NVDA, AMD, AVGO, MSFT, AAPL", "scan_group": "all",
     "scan_min_fresh": 1, "scan_uptrend": True, "scan_min_dollar_vol": 20.0, "scan_top_n": 10,
@@ -558,21 +591,208 @@ with tab_chart:
                    "กราฟย้อนหลังจึงดูแม่นกว่าที่เห็นตอนเทรดจริง และเส้น Fib จะถูกวาดใหม่เมื่อมีสวิงใหม่")
 
 # =====================================================================
+# Tab: custom system (user-picked indicators)
+# =====================================================================
+def price_traces(fig, view):
+    if {"Open", "High", "Low"} <= set(view.columns):
+        fig.add_trace(go.Candlestick(x=view.index, open=view["Open"], high=view["High"], low=view["Low"],
+                                     close=view["Close"], name="ราคา", increasing_line_color=GREEN,
+                                     decreasing_line_color=RED), row=1, col=1)
+    else:
+        fig.add_trace(go.Scatter(x=view.index, y=view["Close"], name="ราคาปิด", line=dict(color=BLUE)), row=1, col=1)
+
+
+def custom_figure(df_, fit_, sels_, win_):
+    view_ = df_.iloc[-win_:] if win_ else df_
+    panel_ = None
+    for s_ in sels_:
+        panel_ = csig.panel_data(df_, s_["key"], s_["params"])
+        if panel_:
+            break
+    two = panel_ is not None
+    f_ = make_subplots(rows=2 if two else 1, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                       row_heights=[0.72, 0.28] if two else [1.0])
+    price_traces(f_, view_)
+    seen = set()
+    for s_ in sels_:
+        for lab, ser, ck, dash in csig.overlays(df_, s_["key"], s_["params"]):
+            if lab in seen:
+                continue
+            seen.add(lab)
+            ser = ser.reindex(view_.index)
+            f_.add_trace(go.Scatter(x=ser.index, y=ser.values, name=lab, mode="lines",
+                                    line=dict(color=COLORS[ck], width=1.6, dash=dash)), row=1, col=1)
+    t_ = fit_["trades"]
+    t_ = t_[t_["exit_date"] >= view_.index[0]].reset_index(drop=True)
+    add_trade_layer(f_, t_, bt.trade_pnl(t_, account, alloc, compound))
+    if two:
+        if panel_["hist"] is not None:
+            hs = panel_["hist"].reindex(view_.index)
+            f_.add_trace(go.Bar(x=hs.index, y=hs.values, name="Histogram",
+                                marker_color=[GREEN if v >= 0 else RED for v in hs.fillna(0)]), row=2, col=1)
+        for lab, ser, ck in panel_["lines"]:
+            ser = ser.reindex(view_.index)
+            f_.add_trace(go.Scatter(x=ser.index, y=ser.values, name=lab, line=dict(color=COLORS[ck], width=1.3)),
+                         row=2, col=1)
+        for y_, ck in panel_["hlines"]:
+            f_.add_hline(y=y_, line_dash="dot", line_color=COLORS[ck], row=2, col=1)
+        if panel_["yrange"]:
+            f_.update_yaxes(range=list(panel_["yrange"]), row=2, col=1)
+    f_.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    f_.update_layout(height=640, xaxis_rangeslider_visible=False, hovermode="x unified",
+                     legend=dict(orientation="h", y=1.05), margin=dict(l=10, r=10, t=30, b=10))
+    return f_
+
+
+custom_fit, custom_sels, custom_mode, custom_hold = None, [], "all", 0
+
+
+with tab_custom:
+    st.markdown("**🛠️ ระบบเลือกเอง** เลือกอินดิเคเตอร์ที่อยากใช้ ปรับค่า แล้วดูจุดซื้อขายบนกราฟพร้อมกำไรขาดทุนตามเงินลงทุนที่ตั้งไว้ "
+                "เป็นระบบเสริม แยกจากกลยุทธ์สำเร็จรูปด้านบน ใช้หุ้น วันที่ และค่าธรรมเนียมชุดเดียวกับที่ตั้งทางซ้าย")
+    keys = list(csig.SPEC)
+    sel_keys = st.multiselect("เลือกอินดิเคเตอร์ (เลือกได้หลายตัว)", keys,
+                              default=[k for k in cfg["custom_sel"] if k in keys],
+                              format_func=lambda k: csig.SPEC[k]["label"], key="w_cs_sel")
+    cfg["custom_sel"] = sel_keys
+    sels = []
+    for k in sel_keys:
+        saved = cfg["custom_params"].get(k, {})
+        with st.expander(f"{csig.SPEC[k]['label']} — {csig.SPEC[k]['desc']}"):
+            plist = csig.SPEC[k]["params"]
+            vals = {}
+            for col, (pk, lab, mn, mx, dflt, stp) in zip(st.columns(len(plist)), plist):
+                v0 = saved.get(pk, dflt)
+                if isinstance(dflt, float):
+                    vals[pk] = float(col.number_input(lab, min_value=float(mn), max_value=float(mx),
+                                                      value=float(v0), step=float(stp), key=f"w_cs_{k}_{pk}"))
+                else:
+                    vals[pk] = int(col.number_input(lab, min_value=int(mn), max_value=int(mx),
+                                                    value=int(v0), step=int(stp), key=f"w_cs_{k}_{pk}"))
+            cfg["custom_params"][k] = vals
+        sels.append({"key": k, "params": vals})
+    m_opts = list(csig.MODES)
+    if len(sels) > 1:
+        cfg["custom_mode"] = st.radio("รวมสัญญาณหลายตัวอย่างไร", m_opts, key="w_cs_mode",
+                                      index=m_opts.index(cfg["custom_mode"]) if cfg["custom_mode"] in m_opts else 0,
+                                      format_func=lambda x: csig.MODES[x])
+    cfg["custom_hold"] = int(st.number_input("ถือไม่เกินกี่วันทำการ (0 = ไม่จำกัด)", min_value=0, max_value=250,
+                                             value=int(cfg["custom_hold"]), key="w_cs_hold"))
+    persist()
+
+    errs = csig.validate(sels, df) if sels else []
+    if not sels:
+        st.info("เลือกอย่างน้อย 1 อินดิเคเตอร์ด้านบน")
+    elif errs:
+        for e_ in errs:
+            st.warning(e_)
+    else:
+        mode_ = cfg["custom_mode"] if len(sels) > 1 else "all"
+        sig_c = csig.build_signal(df, sels, mode_, cfg["custom_hold"])
+        cf = bt.fit_from_signal(df, sig_c, split, cost, "custom")
+        custom_fit, custom_sels, custom_mode, custom_hold = cf, sels, mode_, cfg["custom_hold"]
+        st.caption("กฎ: " + csig.describe(sels, mode_, cfg["custom_hold"]) + " · สัญญาณตอนปิดตลาด ซื้อขายที่ราคาเปิดวันถัดไป")
+        act_c, msg_c = bt.current_action(sig_c)
+        {"BUY": st.success, "SELL": st.error, "HOLD": st.info, "WAIT": st.warning}[act_c](f"**{act_c}** · {msg_c}")
+
+        cs1 = bt.capital_summary(cf["trades"], close, pd.Timestamp(split), account, alloc, compound)
+        st.markdown(f"**💰 ถ้าลงทุน {cur(account)} ตามระบบนี้ตั้งแต่ {split}**")
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("เงินคงเหลือ", cur(cs1["final"]), cur(cs1["pnl"], True))
+        q2.metric("ถ้าซื้อถือเฉย ๆ", cur(cs1["bh_final"]), cur(cs1["bh_pnl"], True), delta_color="off")
+        q3.metric("เทรดที่ชนะ", f"{cs1['wins']}/{cs1['n']}")
+        q4.metric("ดีสุด / แย่สุด", f"{cur(cs1['best'], True)} / {cur(cs1['worst'], True)}")
+
+        cw = st.radio("ช่วงที่แสดงบนกราฟ", list(WINDOWS), index=2, horizontal=True, key="w_cs_win")
+        st.plotly_chart(custom_figure(df, cf, sels, WINDOWS[cw]))
+        st.caption("▲ เขียว = ซื้อ · ▼ แดง = ขาย (ตัวเลขข้างลูกศร = กำไร/ขาดทุนเป็นเงิน) · เส้นหนาเขียว/แดง = เทรดกำไร/ขาดทุน · ◆ ส้ม = ยังถืออยู่")
+
+        mt, mb = cf["test"], m_bh
+        cmp_c = pd.DataFrame({
+            "ระบบเลือกเอง (Test)": [pct(mt["total_return"]), pct(mt["cagr"]), pct(mt["max_drawdown"]),
+                                    round(mt["sharpe"], 2), mt["trades"], pct(mt["win_rate"], 0),
+                                    f"{mt['avg_days']:.1f}"],
+            "ซื้อถือ (Test)": [pct(mb["total_return"]), pct(mb["cagr"]), pct(mb["max_drawdown"]),
+                               round(mb["sharpe"], 2), "-", "-", "-"]},
+            index=["ผลตอบแทนรวม", "CAGR", "Max drawdown", "Sharpe", "จำนวนเทรด", "Win rate", "ถือเฉลี่ย (วัน)"])
+        st.dataframe(cmp_c)
+        if cf["train"].get("sharpe", 0) > 0 and mt["sharpe"] < 0.5 * cf["train"]["sharpe"]:
+            st.warning("Sharpe ช่วง Test ตกจาก Train เกินครึ่ง อาจเป็นเพราะค่าที่ตั้งเข้ากับอดีตมากเกินไป")
+        if mt.get("trades", 0) < 20:
+            st.warning("เทรดน้อยกว่า 20 ครั้งในช่วง Test สถิติยังไม่น่าเชื่อถือ")
+        st.info("💡 การลองปรับค่าหลายรอบแล้วเลือกชุดที่ดูดีที่สุด คือการ overfit ด้วยมือ ดูผลช่วง Test เป็นหลัก "
+                "ลองกับหุ้นตัวอื่น และดูตาราง walk-forward/ทนต่อต้นทุนของกลยุทธ์สำเร็จรูปเทียบ")
+        only_t = st.checkbox("ตารางเทรด: เฉพาะช่วงทดสอบ", value=True, key="w_cs_onlytest")
+        tc = cf["trades"][cf["trades"]["entry_date"] >= pd.Timestamp(split)] if only_t else cf["trades"]
+        if len(tc):
+            tcp = bt.trade_pnl(tc, account, alloc, compound)
+            o2 = tcp.copy()
+            o2["return"] = (o2["return"] * 100).round(2)
+            for k_ in ("invested", "pnl", "balance"):
+                o2[k_] = o2[k_].map(conv).round(0)
+            o2["entry_date"], o2["exit_date"] = o2["entry_date"].dt.date, o2["exit_date"].dt.date
+            st.dataframe(o2.rename(columns={
+                "entry_date": "วันเข้า", "entry_price": "ราคาเข้า", "exit_date": "วันออก", "exit_price": "ราคาออก",
+                "return": "ผลตอบแทน (%)", "status": "สถานะ", "days": "วันที่ถือ", "invested": "เงินที่ลงทุน",
+                "pnl": "กำไร/ขาดทุน", "balance": "ยอดคงเหลือ"}), hide_index=True)
+
+# =====================================================================
 # Tab 3: results
 # =====================================================================
 with tab_res:
+    r_opts = [""] + list(fits) + (["custom"] if custom_fit is not None else [])
+
+    def _rl(x):
+        if x == "":
+            return f"ตามที่เลือกทางซ้าย: {LABEL[name]}"
+        return "🛠️ ระบบเลือกเอง (ตั้งค่าในแท็บ 🛠️)" if x == "custom" else LABEL[x]
+
+    cfg["res_pick"] = st.selectbox("เลือกเทคนิคที่จะดูผลทดสอบละเอียด", r_opts, key="w_res_pick", format_func=_rl,
+                                   index=r_opts.index(cfg["res_pick"]) if cfg["res_pick"] in r_opts else 0)
+    rname = cfg["res_pick"] or name
+    rfit = custom_fit if rname == "custom" else fits[rname]
+    rlabel = "ระบบเลือกเอง" if rname == "custom" else LABEL[rname]
+    manual_on = False
+    edit_name = "gtr" if rname == "gtr_default" else rname
+    if rname != "custom" and edit_name in bt.STRATEGIES and bt.STRATEGIES[edit_name][1]:
+        cfg["res_manual"] = st.checkbox("กำหนดพารามิเตอร์เองแทนค่าที่ระบบเลือกจากช่วง Train", value=bool(cfg["res_manual"]),
+                                        key="w_res_manual")
+        if cfg["res_manual"]:
+            keys_ = list(bt.STRATEGIES[edit_name][1])
+            if rname == "gtr_default":
+                start_p = {k_: bt.GTR_DEFAULTS[k_] for k_ in keys_}
+            else:
+                start_p = {k_: (rfit["params"] or {}).get(k_, bt.STRATEGIES[edit_name][1][k_][0]) for k_ in keys_}
+            vals_ = param_inputs(start_p, cfg["res_params"].get(rname, {}), f"w_rp_{rname}")
+            cfg["res_params"][rname] = vals_
+            errs_ = bt.params_valid(vals_)
+            if errs_:
+                for e_ in errs_:
+                    st.warning(e_)
+            else:
+                rfit = bt.fit_fixed(df, split, edit_name, vals_, cost)
+                rlabel += " (กำหนดค่าเอง)"
+                manual_on = True
+                st.caption("ค่าที่กำหนดเองไม่ผ่านการเลือกจากช่วง Train ดูผลช่วง Test เป็นหลัก "
+                           "และระวังการลองหลายค่าจนเจอชุดที่ดูดีโดยบังเอิญ")
+    persist()
+    if rname != "custom":
+        st.caption(f"พารามิเตอร์ที่ใช้: {rfit['params'] or 'ไม่มี (ค่าคงที่)'}")
     st.markdown("**ผลช่วงทดสอบ (Out-of-sample) — ช่วงที่ไม่ได้ใช้เลือกพารามิเตอร์**")
-    rows = []
-    for n, f in fits.items():
-        m = f["test"]
-        rows.append({
-            "กลยุทธ์": LABEL[n] + (" ◀" if n == name else ""),
-            "ผลตอบแทนรวม": pct(m["total_return"]), "CAGR": pct(m["cagr"]),
-            "Max drawdown": pct(m["max_drawdown"]), "Sharpe": round(m["sharpe"], 2),
-            "เวลาอยู่ในตลาด": pct(m["time_in_market"], 0), "จำนวนเทรด": m["trades"],
-            "ถือเฉลี่ย (วัน)": round(m["avg_days"], 1),
-            "Win rate": pct(m["win_rate"], 0), "กำไรเฉลี่ย/เทรด": pct(m["expectancy"]),
-            "Profit factor": "∞" if np.isinf(m["profit_factor"]) else round(m["profit_factor"], 2)})
+
+    def _mrow(label, m):
+        return {"กลยุทธ์": label, "ผลตอบแทนรวม": pct(m["total_return"]), "CAGR": pct(m["cagr"]),
+                "Max drawdown": pct(m["max_drawdown"]), "Sharpe": round(m["sharpe"], 2),
+                "เวลาอยู่ในตลาด": pct(m["time_in_market"], 0), "จำนวนเทรด": m["trades"],
+                "ถือเฉลี่ย (วัน)": round(m["avg_days"], 1), "Win rate": pct(m["win_rate"], 0),
+                "กำไรเฉลี่ย/เทรด": pct(m["expectancy"]),
+                "Profit factor": "∞" if np.isinf(m["profit_factor"]) else round(m["profit_factor"], 2)}
+
+    rows = [_mrow(LABEL[n] + (" ◀" if n == rname and not manual_on else ""), f["test"]) for n, f in fits.items()]
+    if manual_on:
+        rows.append(_mrow(rlabel + " ◀", rfit["test"]))
+    if custom_fit is not None:
+        rows.append(_mrow("🛠️ ระบบเลือกเอง" + (" ◀" if rname == "custom" else ""), custom_fit["test"]))
     rows.append({
         "กลยุทธ์": "ซื้อถือ (buy & hold)", "ผลตอบแทนรวม": pct(m_bh["total_return"]),
         "CAGR": pct(m_bh["cagr"]), "Max drawdown": pct(m_bh["max_drawdown"]),
@@ -580,7 +800,7 @@ with tab_res:
         "Win rate": "-", "กำไรเฉลี่ย/เทรด": "-", "Profit factor": "-"})
     st.dataframe(pd.DataFrame(rows), hide_index=True)
 
-    m_tr, m_te = fit["train"], fit["test"]
+    m_tr, m_te = rfit["train"], rfit["test"]
     notes = []
     notes.append("✅ Sharpe ชนะ buy & hold" if m_te["sharpe"] > m_bh["sharpe"] else "❌ Sharpe แพ้ buy & hold")
     notes.append("✅ drawdown ตื้นกว่า" if m_te["max_drawdown"] > m_bh["max_drawdown"] else "❌ drawdown ลึกกว่าหรือเท่ากัน")
@@ -590,9 +810,9 @@ with tab_res:
         notes.append("⚠️ Sharpe ตกจาก Train เกินครึ่ง (เสี่ยง overfit)")
     if m_te.get("trades", 0) < 20:
         notes.append("⚠️ เทรดน้อยกว่า 20 ครั้ง สถิติยังไม่น่าเชื่อถือ")
-    st.write(f"**{LABEL[name]}**: " + " · ".join(notes))
+    st.write(f"**{rlabel}**: " + " · ".join(notes))
 
-    cs0 = bt.capital_summary(fit["trades"], close, pd.Timestamp(split), account, alloc, compound)
+    cs0 = bt.capital_summary(rfit["trades"], close, pd.Timestamp(split), account, alloc, compound)
     st.markdown(f"**💰 ถ้าลงทุน {cur(account)} ตามกลยุทธ์นี้ตั้งแต่ {split}** "
                 f"(ใช้ {alloc * 100:.0f}% ของพอร์ตต่อเทรด, {'ทบต้น' if compound else 'ไม่ทบต้น'}, หักค่าธรรมเนียมแล้ว)")
     k1, k2, k3, k4 = st.columns(4)
@@ -616,7 +836,7 @@ with tab_res:
     st.dataframe(cmp_df)
 
     st.markdown("**ทดสอบความทนต่อต้นทุน** (ช่วง Test, ใช้สัญญาณเดิม แต่ค่าธรรมเนียม+สลิปเพจสูงขึ้น)")
-    cs = bt.cost_stress(df, fit, split, cost)
+    cs = bt.cost_stress(df, rfit, split, cost)
     cs_show = pd.DataFrame({
         "ต้นทุนต่อข้าง": [f"{v:.2f}%  ({int(k)}x)" for v, k in zip(cs["cost_pct"], cs["mult"])],
         "ผลตอบแทนรวม": [pct(v) for v in cs["total_return"]],
@@ -627,7 +847,7 @@ with tab_res:
     st.caption("ถ้ากำไรหายหรือ Sharpe ติดลบเมื่อต้นทุนเพิ่มแค่ 2 เท่า แปลว่ากลยุทธ์บางเกินไปสำหรับใช้จริง "
                "โดยเฉพาะกลยุทธ์เทรดสั้นที่เทรดถี่")
 
-    te = fit["trades"][fit["trades"]["entry_date"] >= pd.Timestamp(split)]
+    te = rfit["trades"][rfit["trades"]["entry_date"] >= pd.Timestamp(split)]
     if len(te):
         streak = best_streak = 0
         for v in te["return"]:
@@ -641,13 +861,13 @@ with tab_res:
 
     include_train = st.checkbox("แสดงรวมช่วง Train (ช่วงนี้ถูกปรับพารามิเตอร์ให้เข้ากับข้อมูล ไม่ควรเชื่อ)")
     sp = pd.Timestamp(split)
-    d_s = fit["daily"] if include_train else fit["daily"][fit["daily"].index >= sp]
+    d_s = rfit["daily"] if include_train else rfit["daily"][rfit["daily"].index >= sp]
     d_b = bh_daily.reindex(d_s.index).fillna(0)
     eq_s, eq_b = (1 + d_s).cumprod(), (1 + d_b).cumprod()
     fig2 = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.68, 0.32])
-    fig2.add_trace(go.Scatter(x=eq_s.index, y=eq_s.values, name=LABEL[name], line=dict(color=BLUE)), row=1, col=1)
+    fig2.add_trace(go.Scatter(x=eq_s.index, y=eq_s.values, name=rlabel, line=dict(color=BLUE)), row=1, col=1)
     fig2.add_trace(go.Scatter(x=eq_b.index, y=eq_b.values, name="ซื้อถือ", line=dict(color=GREY)), row=1, col=1)
-    for eq, label, color in [(eq_s, LABEL[name], BLUE), (eq_b, "ซื้อถือ", GREY)]:
+    for eq, label, color in [(eq_s, rlabel, BLUE), (eq_b, "ซื้อถือ", GREY)]:
         dd = eq / eq.cummax() - 1
         fig2.add_trace(go.Scatter(x=dd.index, y=dd.values * 100, name=f"DD {label}", fill="tozeroy",
                                   line=dict(color=color, width=1), showlegend=False), row=2, col=1)
@@ -732,148 +952,6 @@ with tab_wf:
             st.write(f"- {label}: **{value}**")
         st.info("พารามิเตอร์ที่ฝึกใหม่ตามข้อมูลล่าสุดเหมาะใช้ดูสัญญาณจริงมากกว่าค่าที่ตรึงไว้ที่ปี 2020 "
                 "แต่ยังเป็นการเรียนรู้จากอดีต ไม่ใช่การทำนายอนาคต")
-
-# =====================================================================
-# Tab: custom system (user-picked indicators)
-# =====================================================================
-def price_traces(fig, view):
-    if {"Open", "High", "Low"} <= set(view.columns):
-        fig.add_trace(go.Candlestick(x=view.index, open=view["Open"], high=view["High"], low=view["Low"],
-                                     close=view["Close"], name="ราคา", increasing_line_color=GREEN,
-                                     decreasing_line_color=RED), row=1, col=1)
-    else:
-        fig.add_trace(go.Scatter(x=view.index, y=view["Close"], name="ราคาปิด", line=dict(color=BLUE)), row=1, col=1)
-
-
-def custom_figure(df_, fit_, sels_, win_):
-    view_ = df_.iloc[-win_:] if win_ else df_
-    panel_ = None
-    for s_ in sels_:
-        panel_ = csig.panel_data(df_, s_["key"], s_["params"])
-        if panel_:
-            break
-    two = panel_ is not None
-    f_ = make_subplots(rows=2 if two else 1, cols=1, shared_xaxes=True, vertical_spacing=0.03,
-                       row_heights=[0.72, 0.28] if two else [1.0])
-    price_traces(f_, view_)
-    seen = set()
-    for s_ in sels_:
-        for lab, ser, ck, dash in csig.overlays(df_, s_["key"], s_["params"]):
-            if lab in seen:
-                continue
-            seen.add(lab)
-            ser = ser.reindex(view_.index)
-            f_.add_trace(go.Scatter(x=ser.index, y=ser.values, name=lab, mode="lines",
-                                    line=dict(color=COLORS[ck], width=1.6, dash=dash)), row=1, col=1)
-    t_ = fit_["trades"]
-    t_ = t_[t_["exit_date"] >= view_.index[0]].reset_index(drop=True)
-    add_trade_layer(f_, t_, bt.trade_pnl(t_, account, alloc, compound))
-    if two:
-        if panel_["hist"] is not None:
-            hs = panel_["hist"].reindex(view_.index)
-            f_.add_trace(go.Bar(x=hs.index, y=hs.values, name="Histogram",
-                                marker_color=[GREEN if v >= 0 else RED for v in hs.fillna(0)]), row=2, col=1)
-        for lab, ser, ck in panel_["lines"]:
-            ser = ser.reindex(view_.index)
-            f_.add_trace(go.Scatter(x=ser.index, y=ser.values, name=lab, line=dict(color=COLORS[ck], width=1.3)),
-                         row=2, col=1)
-        for y_, ck in panel_["hlines"]:
-            f_.add_hline(y=y_, line_dash="dot", line_color=COLORS[ck], row=2, col=1)
-        if panel_["yrange"]:
-            f_.update_yaxes(range=list(panel_["yrange"]), row=2, col=1)
-    f_.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-    f_.update_layout(height=640, xaxis_rangeslider_visible=False, hovermode="x unified",
-                     legend=dict(orientation="h", y=1.05), margin=dict(l=10, r=10, t=30, b=10))
-    return f_
-
-
-with tab_custom:
-    st.markdown("**🛠️ ระบบเลือกเอง** เลือกอินดิเคเตอร์ที่อยากใช้ ปรับค่า แล้วดูจุดซื้อขายบนกราฟพร้อมกำไรขาดทุนตามเงินลงทุนที่ตั้งไว้ "
-                "เป็นระบบเสริม แยกจากกลยุทธ์สำเร็จรูปด้านบน ใช้หุ้น วันที่ และค่าธรรมเนียมชุดเดียวกับที่ตั้งทางซ้าย")
-    keys = list(csig.SPEC)
-    sel_keys = st.multiselect("เลือกอินดิเคเตอร์ (เลือกได้หลายตัว)", keys,
-                              default=[k for k in cfg["custom_sel"] if k in keys],
-                              format_func=lambda k: csig.SPEC[k]["label"], key="w_cs_sel")
-    cfg["custom_sel"] = sel_keys
-    sels = []
-    for k in sel_keys:
-        saved = cfg["custom_params"].get(k, {})
-        with st.expander(f"{csig.SPEC[k]['label']} — {csig.SPEC[k]['desc']}"):
-            plist = csig.SPEC[k]["params"]
-            vals = {}
-            for col, (pk, lab, mn, mx, dflt, stp) in zip(st.columns(len(plist)), plist):
-                v0 = saved.get(pk, dflt)
-                if isinstance(dflt, float):
-                    vals[pk] = float(col.number_input(lab, min_value=float(mn), max_value=float(mx),
-                                                      value=float(v0), step=float(stp), key=f"w_cs_{k}_{pk}"))
-                else:
-                    vals[pk] = int(col.number_input(lab, min_value=int(mn), max_value=int(mx),
-                                                    value=int(v0), step=int(stp), key=f"w_cs_{k}_{pk}"))
-            cfg["custom_params"][k] = vals
-        sels.append({"key": k, "params": vals})
-    m_opts = list(csig.MODES)
-    if len(sels) > 1:
-        cfg["custom_mode"] = st.radio("รวมสัญญาณหลายตัวอย่างไร", m_opts, key="w_cs_mode",
-                                      index=m_opts.index(cfg["custom_mode"]) if cfg["custom_mode"] in m_opts else 0,
-                                      format_func=lambda x: csig.MODES[x])
-    cfg["custom_hold"] = int(st.number_input("ถือไม่เกินกี่วันทำการ (0 = ไม่จำกัด)", min_value=0, max_value=250,
-                                             value=int(cfg["custom_hold"]), key="w_cs_hold"))
-    persist()
-
-    errs = csig.validate(sels, df) if sels else []
-    if not sels:
-        st.info("เลือกอย่างน้อย 1 อินดิเคเตอร์ด้านบน")
-    elif errs:
-        for e_ in errs:
-            st.warning(e_)
-    else:
-        mode_ = cfg["custom_mode"] if len(sels) > 1 else "all"
-        sig_c = csig.build_signal(df, sels, mode_, cfg["custom_hold"])
-        cf = bt.fit_from_signal(df, sig_c, split, cost, "custom")
-        st.caption("กฎ: " + csig.describe(sels, mode_, cfg["custom_hold"]) + " · สัญญาณตอนปิดตลาด ซื้อขายที่ราคาเปิดวันถัดไป")
-        act_c, msg_c = bt.current_action(sig_c)
-        {"BUY": st.success, "SELL": st.error, "HOLD": st.info, "WAIT": st.warning}[act_c](f"**{act_c}** · {msg_c}")
-
-        cs1 = bt.capital_summary(cf["trades"], close, pd.Timestamp(split), account, alloc, compound)
-        st.markdown(f"**💰 ถ้าลงทุน {cur(account)} ตามระบบนี้ตั้งแต่ {split}**")
-        q1, q2, q3, q4 = st.columns(4)
-        q1.metric("เงินคงเหลือ", cur(cs1["final"]), cur(cs1["pnl"], True))
-        q2.metric("ถ้าซื้อถือเฉย ๆ", cur(cs1["bh_final"]), cur(cs1["bh_pnl"], True), delta_color="off")
-        q3.metric("เทรดที่ชนะ", f"{cs1['wins']}/{cs1['n']}")
-        q4.metric("ดีสุด / แย่สุด", f"{cur(cs1['best'], True)} / {cur(cs1['worst'], True)}")
-
-        cw = st.radio("ช่วงที่แสดงบนกราฟ", list(WINDOWS), index=2, horizontal=True, key="w_cs_win")
-        st.plotly_chart(custom_figure(df, cf, sels, WINDOWS[cw]))
-        st.caption("▲ เขียว = ซื้อ · ▼ แดง = ขาย (ตัวเลขข้างลูกศร = กำไร/ขาดทุนเป็นเงิน) · เส้นหนาเขียว/แดง = เทรดกำไร/ขาดทุน · ◆ ส้ม = ยังถืออยู่")
-
-        mt, mb = cf["test"], m_bh
-        cmp_c = pd.DataFrame({
-            "ระบบเลือกเอง (Test)": [pct(mt["total_return"]), pct(mt["cagr"]), pct(mt["max_drawdown"]),
-                                    round(mt["sharpe"], 2), mt["trades"], pct(mt["win_rate"], 0),
-                                    f"{mt['avg_days']:.1f}"],
-            "ซื้อถือ (Test)": [pct(mb["total_return"]), pct(mb["cagr"]), pct(mb["max_drawdown"]),
-                               round(mb["sharpe"], 2), "-", "-", "-"]},
-            index=["ผลตอบแทนรวม", "CAGR", "Max drawdown", "Sharpe", "จำนวนเทรด", "Win rate", "ถือเฉลี่ย (วัน)"])
-        st.dataframe(cmp_c)
-        if cf["train"].get("sharpe", 0) > 0 and mt["sharpe"] < 0.5 * cf["train"]["sharpe"]:
-            st.warning("Sharpe ช่วง Test ตกจาก Train เกินครึ่ง อาจเป็นเพราะค่าที่ตั้งเข้ากับอดีตมากเกินไป")
-        if mt.get("trades", 0) < 20:
-            st.warning("เทรดน้อยกว่า 20 ครั้งในช่วง Test สถิติยังไม่น่าเชื่อถือ")
-        st.info("💡 การลองปรับค่าหลายรอบแล้วเลือกชุดที่ดูดีที่สุด คือการ overfit ด้วยมือ ดูผลช่วง Test เป็นหลัก "
-                "ลองกับหุ้นตัวอื่น และดูตาราง walk-forward/ทนต่อต้นทุนของกลยุทธ์สำเร็จรูปเทียบ")
-        only_t = st.checkbox("ตารางเทรด: เฉพาะช่วงทดสอบ", value=True, key="w_cs_onlytest")
-        tc = cf["trades"][cf["trades"]["entry_date"] >= pd.Timestamp(split)] if only_t else cf["trades"]
-        if len(tc):
-            tcp = bt.trade_pnl(tc, account, alloc, compound)
-            o2 = tcp.copy()
-            o2["return"] = (o2["return"] * 100).round(2)
-            for k_ in ("invested", "pnl", "balance"):
-                o2[k_] = o2[k_].map(conv).round(0)
-            o2["entry_date"], o2["exit_date"] = o2["entry_date"].dt.date, o2["exit_date"].dt.date
-            st.dataframe(o2.rename(columns={
-                "entry_date": "วันเข้า", "entry_price": "ราคาเข้า", "exit_date": "วันออก", "exit_price": "ราคาออก",
-                "return": "ผลตอบแทน (%)", "status": "สถานะ", "days": "วันที่ถือ", "invested": "เงินที่ลงทุน",
-                "pnl": "กำไร/ขาดทุน", "balance": "ยอดคงเหลือ"}), hide_index=True)
 
 # =====================================================================
 # Tab: AI assistant (statistical model trained offline, loaded from file)
@@ -1081,10 +1159,38 @@ with tab_scan:
     cfg["scan_uptrend"] = f3.checkbox("เฉพาะที่ราคาอยู่เหนือ SMA200", value=bool(cfg["scan_uptrend"]), key="w_scan_up")
     persist()
 
-    scan_names = [n for n in bt.SCAN_SPECS if in_group(n, cfg["scan_group"])]
-    with st.expander("สัญญาณที่ใช้และพารามิเตอร์ (ค่ามาตรฐาน ไม่ได้ปรับตามหุ้นแต่ละตัว)"):
+    sig_all = list(bt.SCAN_SPECS) + (["custom"] if custom_fit is not None else [])
+    cfg["scan_signals"] = st.multiselect(
+        "เลือกสัญญาณเอง (ถ้าไม่เลือก = ใช้ตามชนิดด้านบน)", sig_all, key="w_scan_sigs", format_func=scan_label,
+        default=[x for x in cfg["scan_signals"] if x in sig_all])
+    persist()
+    scan_names = cfg["scan_signals"] or [n for n in bt.SCAN_SPECS if in_group(n, cfg["scan_group"])]
+    scan_specs = {}
+    scan_extra = {}
+    with st.expander("⚙️ ปรับพารามิเตอร์ของสัญญาณแบบละเอียด (ค่าเริ่มต้น = ค่ามาตรฐาน)"):
+        st.caption("ค่าที่แก้ใช้กับการสแกนครั้งต่อไป และขั้นที่ 2 จะทดสอบย้อนหลังด้วยค่าชุดเดียวกันนี้ "
+                   "หุ้นทุกตัวใช้ค่าเดียวกัน ไม่ได้ปรับตามหุ้นแต่ละตัว")
         for n in scan_names:
-            st.write(f"- `{n}` {LABEL[n]} {bt.SCAN_SPECS[n] or ''}")
+            if n == "custom":
+                scan_extra["custom"] = lambda d_, _s=custom_sels, _m=custom_mode, _h=custom_hold: \
+                    csig.build_signal(d_, _s, _m, _h)
+                st.markdown(f"**{scan_label(n)}**: " + csig.describe(custom_sels, custom_mode, custom_hold)
+                            + "  \n(แก้ได้ในแท็บ 🛠️ ระบบเลือกเอง)")
+                continue
+            base = bt.SCAN_SPECS[n]
+            st.markdown(f"**{LABEL[n] if n != 'gtr' else 'GTR (ค่าเริ่มต้น = ค่าตั้งต้นของผู้เขียน)'}**")
+            vals = param_inputs(base, cfg["scan_params"].get(n, {}), f"w_sp_{n}")
+            cfg["scan_params"][n] = vals
+            e_ = bt.params_valid(vals)
+            for x_ in e_:
+                st.warning(f"{scan_label(n)}: {x_}")
+            scan_specs[n] = vals if not e_ else dict(base)
+        if st.button("รีเซ็ตพารามิเตอร์ทั้งหมดเป็นค่ามาตรฐาน"):
+            cfg["scan_params"] = {}
+            for k_ in [k_ for k_ in st.session_state if k_.startswith("w_sp_")]:
+                del st.session_state[k_]
+            st.rerun()
+    persist()
 
     if st.button("🔍 สแกนตอนนี้", type="primary"):
         meta = pd.DataFrame(columns=["name", "sector"])
@@ -1102,12 +1208,13 @@ with tab_scan:
             chunk = tuple(tks[i:i + 50])
             try:
                 for t_, d_ in download_chunk(chunk).items():
-                    rows[t_] = bt.scan_ticker(d_, scan_names)
+                    rows[t_] = bt.scan_ticker(d_, scan_names, specs=scan_specs, extra=scan_extra)
             except Exception:
                 failed += len(chunk)
             prog.progress(min(1.0, (i + 50) / len(tks)), text=f"ดึงและวิเคราะห์ {min(i + 50, len(tks))}/{len(tks)}")
         prog.empty()
-        st.session_state.update(scan_rows=rows, scan_meta=meta, scan_names=scan_names,
+        st.session_state.update(scan_rows=rows, scan_meta=meta, scan_names=scan_names, scan_specs=dict(scan_specs),
+                                scan_custom=(custom_sels, custom_mode, custom_hold) if "custom" in scan_names else None,
                                 scan_when=pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"), scan_failed=failed)
         st.session_state.pop("scan_deep", None)
 
@@ -1131,7 +1238,7 @@ with tab_scan:
                 "บริษัท": res["ticker"].map(meta["name"]) if "name" in meta else "",
                 "กลุ่ม": res["ticker"].map(meta["sector"]) if "sector" in meta else "",
                 "ราคาปิด": res["close"].round(2),
-                "สัญญาณซื้อใหม่": [", ".join(f) for f in res["fresh"]],
+                "สัญญาณซื้อใหม่": [", ".join(scan_label(x_) for x_ in f) for f in res["fresh"]],
                 "จำนวนใหม่": res["n_fresh"],
                 "อยู่ในโหมดซื้อ (ตัว)": res["n_long"],
                 "1M %": (res["ret_1m"] * 100).round(1), "3M %": (res["ret_3m"] * 100).round(1),
@@ -1144,26 +1251,35 @@ with tab_scan:
                                file_name="scan_results.csv", mime="text/csv")
 
             st.markdown("**ขั้นที่ 2: ตรวจย้อนหลังเต็ม (Train/Test) ของหุ้นอันดับต้น ๆ**")
+            st.caption("ทดสอบสัญญาณที่เพิ่งเกิด ด้วยพารามิเตอร์ชุดเดียวกับที่ใช้สแกน (ไม่ได้ปรับใหม่ตามหุ้น) "
+                       "เทียบกับการซื้อถือในช่วง Test หุ้นละไม่เกิน 3 สัญญาณ")
             cfg["scan_top_n"] = int(st.slider("จำนวนหุ้นที่ตรวจ", 3, 20, int(cfg["scan_top_n"]), key="w_scan_topn"))
             if st.button("ตรวจย้อนหลังเต็ม"):
                 deep, tops = [], res["ticker"].head(cfg["scan_top_n"]).tolist()
+                used = st.session_state.get("scan_specs", {})
+                used_custom = st.session_state.get("scan_custom")
                 prog = st.progress(0.0, text="กำลังทดสอบ...")
                 for i, tk in enumerate(tops):
                     try:
                         d_ = get_df(tk, start)
-                        f_, mb_, _ = get_eval(tk, start, split, cost)
-                        nm = strat_choice if strat_choice in f_ else auto_pick(f_, group)
-                        ff = f_[nm]
-                        act, _ = bt.current_action_for(ff)
-                        deep.append({
-                            "หุ้น": tk, "กลยุทธ์ที่เลือก (จาก Train)": LABEL[nm], "สัญญาณวันนี้": act,
-                            "Sharpe (Test)": round(ff["test"]["sharpe"], 2),
-                            "Sharpe ซื้อถือ": round(mb_["sharpe"], 2),
-                            "ชนะซื้อถือ?": "✅" if ff["test"]["sharpe"] > mb_["sharpe"] else "❌",
-                            "Max DD (Test)": pct(ff["test"]["max_drawdown"]),
-                            "เทรด (Test)": ff["test"]["trades"]})
+                        mb_ = bt.bh_test_metrics(d_, split)
+                        r_ = rows[tk]
+                        for nm in (r_["fresh"] or r_["long"])[:3]:
+                            if nm == "custom" and used_custom:
+                                sg_ = csig.build_signal(d_, *used_custom)
+                                ff = bt.fit_from_signal(d_, sg_, split, cost, "custom")
+                            else:
+                                ff = bt.fit_fixed(d_, split, nm, used.get(nm, bt.SCAN_SPECS[nm]), cost)
+                            act, _ = bt.current_action_for(ff)
+                            deep.append({
+                                "หุ้น": tk, "สัญญาณ": scan_label(nm), "วันนี้": act,
+                                "Sharpe (Test)": round(ff["test"]["sharpe"], 2),
+                                "Sharpe ซื้อถือ": round(mb_["sharpe"], 2),
+                                "ชนะซื้อถือ?": "✅" if ff["test"]["sharpe"] > mb_["sharpe"] else "❌",
+                                "Max DD (Test)": pct(ff["test"]["max_drawdown"]),
+                                "เทรด (Test)": ff["test"]["trades"], "Win rate": pct(ff["test"]["win_rate"], 0)})
                     except Exception as e:
-                        deep.append({"หุ้น": tk, "กลยุทธ์ที่เลือก (จาก Train)": f"error: {e}"})
+                        deep.append({"หุ้น": tk, "สัญญาณ": f"error: {e}"})
                     prog.progress((i + 1) / len(tops), text=f"{i + 1}/{len(tops)}")
                 prog.empty()
                 st.session_state["scan_deep"] = pd.DataFrame(deep)
